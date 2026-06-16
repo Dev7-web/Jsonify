@@ -36,19 +36,23 @@ def _expand_merged_cells(worksheet: Worksheet) -> None:
                 worksheet.cell(row_index, column_index).value = top_left_value
 
 
-# ponytail: full grid kept in memory (no read_only mode, since merged-cell info
-# is only available in normal mode). Safe under the 25 MB upload limit.
-# Switch to streaming header detection if uploads grow much larger.
-def load_sheets(path: str | Path) -> dict[str, Grid]:
+def _open_workbook(path: str | Path, *, read_only: bool):
     workbook_path = Path(path)
 
     if not workbook_path.is_file():
         raise FileNotFoundError(f"Excel file not found: {workbook_path}")
 
     try:
-        workbook = load_workbook(workbook_path, data_only=True)
+        return load_workbook(workbook_path, data_only=True, read_only=read_only)
     except (BadZipFile, InvalidFileException) as error:
         raise ValueError(f"File is not a valid .xlsx workbook: {workbook_path}") from error
+
+
+# ponytail: full grid kept in memory (no read_only mode, since merged-cell info
+# is only available in normal mode). Safe under the 25 MB upload limit.
+# Switch to streaming header detection if uploads grow much larger.
+def load_sheets(path: str | Path) -> dict[str, Grid]:
+    workbook = _open_workbook(path, read_only=False)
 
     try:
         sheets: dict[str, Grid] = {}
