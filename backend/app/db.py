@@ -1,21 +1,12 @@
 import os
-from pathlib import Path
 
-from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo import ASCENDING
 
+from .config import get_required_env
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 _client: AsyncIOMotorClient | None = None
-
-
-def _get_required_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"{name} is not set. Add it to backend/.env.")
-    return value
 
 
 def get_database_name() -> str:
@@ -27,7 +18,7 @@ def get_client() -> AsyncIOMotorClient:
 
     if _client is None:
         _client = AsyncIOMotorClient(
-            _get_required_env("MONGODB_URI"),
+            get_required_env("MONGODB_URI"),
             serverSelectionTimeoutMS=5000,
         )
 
