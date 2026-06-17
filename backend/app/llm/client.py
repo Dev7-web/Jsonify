@@ -36,6 +36,7 @@ def call_llm(
     model: str | None = None,
     temperature: float = DEFAULT_LLM_TEMPERATURE,
     max_retries: int | None = None,
+    response_mime_type: str | None = None,
 ) -> str:
     """Call Gemini synchronously. Use from scripts and sync code only."""
     _validate_prompts(system, user)
@@ -46,6 +47,7 @@ def call_llm(
         model=model or get_llm_model(),
         temperature=temperature,
         max_retries=get_llm_max_retries() if max_retries is None else max_retries,
+        response_mime_type=response_mime_type,
     )
 
 
@@ -56,6 +58,7 @@ async def acall_llm(
     model: str | None = None,
     temperature: float = DEFAULT_LLM_TEMPERATURE,
     max_retries: int | None = None,
+    response_mime_type: str | None = None,
 ) -> str:
     """Async sibling of `call_llm`. Use from FastAPI route handlers so retry
     sleeps don't block the event loop."""
@@ -67,6 +70,7 @@ async def acall_llm(
         model=model or get_llm_model(),
         temperature=temperature,
         max_retries=get_llm_max_retries() if max_retries is None else max_retries,
+        response_mime_type=response_mime_type,
     )
 
 
@@ -92,11 +96,18 @@ def _get_client() -> genai.Client:
     return _client
 
 
-def _build_config(system: str, temperature: float) -> types.GenerateContentConfig:
-    return types.GenerateContentConfig(
-        system_instruction=system,
-        temperature=temperature,
-    )
+def _build_config(
+    system: str,
+    temperature: float,
+    response_mime_type: str | None,
+) -> types.GenerateContentConfig:
+    kwargs: dict[str, object] = {
+        "system_instruction": system,
+        "temperature": temperature,
+    }
+    if response_mime_type is not None:
+        kwargs["response_mime_type"] = response_mime_type
+    return types.GenerateContentConfig(**kwargs)
 
 
 def _call_with_retry_sync(
@@ -107,15 +118,17 @@ def _call_with_retry_sync(
     model: str,
     temperature: float,
     max_retries: int,
+    response_mime_type: str | None,
 ) -> str:
     retry_base_seconds = get_llm_retry_base_seconds()
+    config = _build_config(system, temperature, response_mime_type)
 
     for attempt in range(max_retries + 1):
         try:
             response = client.models.generate_content(
                 model=model,
                 contents=user,
-                config=_build_config(system, temperature),
+                config=config,
             )
             return _extract_text(response)
         except errors.APIError as error:
@@ -138,15 +151,17 @@ async def _call_with_retry_async(
     model: str,
     temperature: float,
     max_retries: int,
+    response_mime_type: str | None,
 ) -> str:
     retry_base_seconds = get_llm_retry_base_seconds()
+    config = _build_config(system, temperature, response_mime_type)
 
     for attempt in range(max_retries + 1):
         try:
             response = await client.aio.models.generate_content(
                 model=model,
                 contents=user,
-                config=_build_config(system, temperature),
+                config=config,
             )
             return _extract_text(response)
         except errors.APIError as error:

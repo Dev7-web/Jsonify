@@ -8,7 +8,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 load_dotenv(BACKEND_ROOT / ".env")
 
-DEFAULT_LLM_MODEL = "gemini-2.5-flash"
+DEFAULT_LLM_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_LLM_TEMPERATURE = 0.0
 DEFAULT_LLM_MAX_RETRIES = 2
 DEFAULT_LLM_RETRY_BASE_SECONDS = 1.0
