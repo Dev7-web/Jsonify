@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import aiofiles
@@ -6,7 +7,17 @@ from fastapi import APIRouter, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
 from ..db import get_db
+from ..llm.client import LLMCallError, LLMConfigurationError
+from ..llm.header_prompt import HeaderStructureParseError
 from ..models import Document, DocumentStatus, FileType
+from ..pipeline.detect import (
+    DetectionInProgressError,
+    DocumentNotFoundError,
+    InvalidDocumentFileError,
+    StoredDocumentFileError,
+    UnsupportedDocumentTypeError,
+    detect_document_headers,
+)
 
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -32,6 +43,13 @@ class DocumentCreateResponse(BaseModel):
     id: str
     file_type: FileType
     status: DocumentStatus
+
+
+class DocumentDetectHeadersResponse(BaseModel):
+    id: str
+    status: DocumentStatus
+    confidence: float
+    detected_headers: dict[str, Any]
 
 
 def get_file_type(filename: str) -> FileType:
@@ -124,3 +142,46 @@ async def create_document(file: UploadFile) -> DocumentCreateResponse:
         file_type=document.file_type,
         status=document.status,
     )
+
+
+@router.post("/{document_id}/detect-headers", response_model=DocumentDetectHeadersResponse)
+async def detect_headers(document_id: str) -> DocumentDetectHeadersResponse:
+    try:
+        result = await detect_document_headers(document_id)
+    except DocumentNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except DetectionInProgressError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+    except UnsupportedDocumentTypeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except InvalidDocumentFileError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except StoredDocumentFileError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        ) from error
+    except LLMConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
+    except (LLMCallError, HeaderStructureParseError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(error),
+        ) from error
+
+    return DocumentDetectHeadersResponse(**result)

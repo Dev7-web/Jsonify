@@ -38,6 +38,7 @@ class Document(BaseModel):
     detected_headers: dict[str, Any] | None = None
     output_json: dict[str, Any] | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    failure_reason: str | None = None
     created_at: datetime = Field(default_factory=_now_utc)
 
 

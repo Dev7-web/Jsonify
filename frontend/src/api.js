@@ -27,3 +27,19 @@ export async function uploadDocument(file) {
 
   return data;
 }
+
+export async function detectDocumentHeaders(documentId) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/detect-headers`, {
+    method: "POST",
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail ?? `Header detection failed with status ${response.status}`,
+    );
+  }
+
+  return data;
+}

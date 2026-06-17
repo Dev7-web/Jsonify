@@ -83,6 +83,7 @@ Rules:
 - A sheet may have an empty "sections" array if it has no reusable layout headers.
 - For "key_value" sections, include only reusable label names in "fields"; do not include their values.
 - For "table" sections, include column headers in left-to-right order.
+- If a section or table has no visible title in the cells, omit the "title" key; never return an empty title.
 - Preserve the exact sheet names from lines that start with "## Sheet:".
 - Preserve exact header text from the cells, but omit cell coordinates in the JSON.
 
@@ -170,15 +171,11 @@ def _validate_section(value: Any, location: str) -> LayoutSection:
             f'{location}.type must be either "key_value" or "table".'
         )
 
-    title = value.get("title")
-    if title is not None and not _is_non_empty_string(title):
-        raise HeaderStructureParseError(
-            f"{location}.title must be a non-empty string when present."
-        )
+    title = _normalize_optional_title(value.get("title"), location)
 
     section: LayoutSection = {"type": cast(SectionType, section_type)}
     if title is not None:
-        section["title"] = title.strip()
+        section["title"] = title
 
     if section_type == "key_value":
         fields = _validate_string_list(value.get("fields"), f"{location}.fields")
@@ -248,3 +245,19 @@ def _strip_code_fence(raw_text: str) -> str:
 
 def _is_non_empty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _normalize_optional_title(value: Any, location: str) -> str | None:
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise HeaderStructureParseError(
+            f"{location}.title must be a string when present."
+        )
+
+    title = value.strip()
+    if not title:
+        return None
+
+    return title

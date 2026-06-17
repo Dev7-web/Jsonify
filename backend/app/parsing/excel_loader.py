@@ -1,7 +1,8 @@
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
-from zipfile import BadZipFile
+from zipfile import BadZipFile, ZipFile
 
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
@@ -11,6 +12,8 @@ from openpyxl.worksheet.worksheet import Worksheet
 Grid = list[list[Any | None]]
 
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+_UNSUPPORTED_STYLE_XXID_PATTERN = re.compile(rb"\sxxid=(\"[^\"]*\"|'[^']*')")
+_STYLES_XML_PATH = "xl/styles.xml"
 
 
 def normalize_cell_value(value: Any) -> Any | None:
@@ -44,8 +47,86 @@ def _open_workbook(path: str | Path, *, read_only: bool):
 
     try:
         return load_workbook(workbook_path, data_only=True, read_only=read_only)
+    except TypeError as error:
+        if not _is_unsupported_xxid_style_error(error):
+            raise
+
+        return _open_workbook_with_repaired_styles(workbook_path, read_only=read_only)
     except (BadZipFile, InvalidFileException) as error:
         raise ValueError(f"File is not a valid .xlsx workbook: {workbook_path}") from error
+
+
+def _is_unsupported_xxid_style_error(error: TypeError) -> bool:
+    return "unexpected keyword argument 'xxid'" in str(error)
+
+
+def _open_workbook_with_repaired_styles(path: Path, *, read_only: bool):
+    repaired_path = _create_xxid_repaired_workbook(path)
+
+    try:
+        workbook = load_workbook(repaired_path, data_only=True, read_only=read_only)
+    except (BadZipFile, InvalidFileException, TypeError) as error:
+        repaired_path.unlink(missing_ok=True)
+        raise ValueError(
+            f"Excel workbook contains unsupported style metadata and could not be repaired: {path}"
+        ) from error
+    except Exception:
+        repaired_path.unlink(missing_ok=True)
+        raise
+
+    return _cleanup_temp_workbook_on_close(workbook, repaired_path)
+
+
+def _create_xxid_repaired_workbook(path: Path) -> Path:
+    try:
+        with ZipFile(path, "r") as source:
+            if _STYLES_XML_PATH not in source.namelist():
+                raise ValueError("Workbook does not contain xl/styles.xml.")
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".xlsx",
+                prefix="repaired-",
+                delete=False,
+            ) as temp_file:
+                repaired_path = Path(temp_file.name)
+
+            repaired = False
+            try:
+                with ZipFile(repaired_path, "w") as target:
+                    for item in source.infolist():
+                        data = source.read(item.filename)
+                        if item.filename == _STYLES_XML_PATH:
+                            data, replacements = _UNSUPPORTED_STYLE_XXID_PATTERN.subn(
+                                b"",
+                                data,
+                            )
+                            repaired = replacements > 0
+
+                        target.writestr(item, data)
+            except Exception:
+                repaired_path.unlink(missing_ok=True)
+                raise
+
+            if not repaired:
+                repaired_path.unlink(missing_ok=True)
+                raise ValueError("Workbook styles did not contain unsupported xxid metadata.")
+
+            return repaired_path
+    except BadZipFile as error:
+        raise ValueError(f"File is not a valid .xlsx workbook: {path}") from error
+
+
+def _cleanup_temp_workbook_on_close(workbook, repaired_path: Path):
+    original_close = workbook.close
+
+    def close_with_cleanup() -> None:
+        try:
+            original_close()
+        finally:
+            repaired_path.unlink(missing_ok=True)
+
+    workbook.close = close_with_cleanup
+    return workbook
 
 
 # ponytail: full grid kept in memory (no read_only mode, since merged-cell info
