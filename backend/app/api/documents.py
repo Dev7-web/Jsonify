@@ -54,8 +54,11 @@ class DocumentCreateResponse(BaseModel):
 class DocumentDetectHeadersResponse(BaseModel):
     id: str
     status: DocumentStatus
+    source: str
     confidence: float
     detected_headers: dict[str, Any]
+    fingerprint: str | None = None
+    matched_schema_id: str | None = None
 
 
 class DocumentApproveHeadersRequest(BaseModel):

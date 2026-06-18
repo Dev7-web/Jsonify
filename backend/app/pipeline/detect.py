@@ -13,9 +13,13 @@ from app.models import Document
 from app.parsing.excel_loader import load_sheets
 from app.parsing.flatten import flatten_excel
 from app.parsing.header_detector import DetectedHeader, detect_table_headers
+from app.pipeline.fingerprint import SchemaMatch
+from app.pipeline.fingerprint import build_deterministic_header_fingerprint
+from app.pipeline.fingerprint import build_header_label_fingerprint
+from app.pipeline.fingerprint import match_schema_by_fingerprint
 
 
-DetectionSource = Literal["llm"]
+DetectionSource = Literal["llm", "schema"]
 DetectionFlagType = Literal[
     "deterministic_table_missing",
     "deterministic_column_missing",
@@ -33,19 +37,23 @@ class DetectionFlag(TypedDict, total=False):
     message: str
 
 
-class DetectionResult(TypedDict):
+class DetectionResult(TypedDict, total=False):
     source: DetectionSource
     header_structure: HeaderStructure
     deterministic_headers: dict[str, list[DetectedHeader]]
     flags: list[DetectionFlag]
     confidence: float
+    match: dict[str, Any]
 
 
-class DocumentDetectionResponse(TypedDict):
+class DocumentDetectionResponse(TypedDict, total=False):
     id: str
     status: str
+    source: DetectionSource
     confidence: float
     detected_headers: DetectionResult
+    fingerprint: str
+    matched_schema_id: str
 
 
 class DetectHeadersError(RuntimeError):
@@ -101,6 +109,8 @@ async def detect_document_headers(
             "$unset": {
                 "detected_headers": "",
                 "confidence": "",
+                "fingerprint": "",
+                "matched_schema_id": "",
                 "failure_reason": "",
             },
         },
@@ -113,6 +123,15 @@ async def detect_document_headers(
     try:
         workbook_path = _resolve_stored_path(document.stored_path)
         deterministic_headers = _detect_deterministic_headers(workbook_path)
+
+        schema_response = await _detect_known_schema(
+            database,
+            document=document,
+            deterministic_headers=deterministic_headers,
+        )
+        if schema_response is not None:
+            return schema_response
+
         flattened_text = _flatten_workbook(workbook_path)
         header_structure = await adetect_header_structure(flattened_text)
 
@@ -125,6 +144,10 @@ async def detect_document_headers(
             header_structure,
             deterministic_headers,
         )
+        try:
+            candidate_fingerprint = build_header_label_fingerprint(header_structure)
+        except ValueError:
+            candidate_fingerprint = None
 
         detection_result: DetectionResult = {
             "source": "llm",
@@ -134,26 +157,115 @@ async def detect_document_headers(
             "confidence": confidence,
         }
 
-        await database.documents.update_one(
-            {"_id": document_id},
-            {
-                "$set": {
-                    "status": "needs_review",
-                    "detected_headers": detection_result,
-                    "confidence": confidence,
-                }
-            },
-        )
+        update_fields: dict[str, Any] = {
+            "status": "needs_review",
+            "detected_headers": detection_result,
+            "confidence": confidence,
+        }
+        unset_fields: dict[str, str] = {}
+        if candidate_fingerprint is not None:
+            update_fields["fingerprint"] = candidate_fingerprint.fingerprint
+        else:
+            unset_fields["fingerprint"] = ""
+
+        unset_fields["matched_schema_id"] = ""
+
+        update: dict[str, Any] = {"$set": update_fields}
+        if unset_fields:
+            update["$unset"] = unset_fields
+
+        await database.documents.update_one({"_id": document_id}, update)
 
         return {
             "id": document_id,
             "status": "needs_review",
+            "source": "llm",
             "confidence": confidence,
             "detected_headers": detection_result,
+            **(
+                {"fingerprint": candidate_fingerprint.fingerprint}
+                if candidate_fingerprint is not None
+                else {}
+            ),
         }
     except Exception as error:
         await _mark_document_failed(database, document_id, reason=str(error))
         raise
+
+
+async def _detect_known_schema(
+    db: AsyncIOMotorDatabase,
+    *,
+    document: Document,
+    deterministic_headers: dict[str, list[DetectedHeader]],
+) -> DocumentDetectionResponse | None:
+    try:
+        candidate_fingerprint = build_deterministic_header_fingerprint(
+            deterministic_headers,
+        )
+    except ValueError:
+        return None
+
+    schema_match = await match_schema_by_fingerprint(
+        candidate_fingerprint,
+        db=db,
+        file_type=document.file_type,
+    )
+    if schema_match is None:
+        return None
+
+    confidence = schema_match.similarity.score
+    detection_result: DetectionResult = {
+        "source": "schema",
+        "header_structure": schema_match.schema.header_structure,
+        "deterministic_headers": deterministic_headers,
+        "flags": [],
+        "confidence": confidence,
+        "match": _format_schema_match(schema_match, candidate_fingerprint.fingerprint),
+    }
+
+    await db.documents.update_one(
+        {"_id": document.id},
+        {
+            "$set": {
+                "status": "approved",
+                "detected_headers": detection_result,
+                "confidence": confidence,
+                "fingerprint": schema_match.schema.fingerprint,
+                "matched_schema_id": schema_match.schema.id,
+            },
+            "$unset": {"failure_reason": ""},
+        },
+    )
+
+    return {
+        "id": document.id,
+        "status": "approved",
+        "source": "schema",
+        "confidence": confidence,
+        "detected_headers": detection_result,
+        "fingerprint": schema_match.schema.fingerprint,
+        "matched_schema_id": schema_match.schema.id,
+    }
+
+
+def _format_schema_match(
+    schema_match: SchemaMatch,
+    candidate_fingerprint: str,
+) -> dict[str, Any]:
+    similarity = schema_match.similarity
+    return {
+        "schema_id": schema_match.schema.id,
+        "schema_name": schema_match.schema.name,
+        "schema_fingerprint": schema_match.schema.fingerprint,
+        "candidate_fingerprint": candidate_fingerprint,
+        "score": similarity.score,
+        "jaccard": similarity.jaccard,
+        "containment": similarity.containment,
+        "candidate_coverage": similarity.candidate_coverage,
+        "schema_coverage": similarity.schema_coverage,
+        "overlap_count": similarity.overlap_count,
+    }
 
 
 def compare_with_deterministic_headers(
@@ -315,13 +427,34 @@ def _resolve_stored_path(stored_path: str) -> Path:
 def _detect_deterministic_headers(path: Path) -> dict[str, list[DetectedHeader]]:
     try:
         return {
-            sheet_name: detect_table_headers(grid)
+            sheet_name: _deduplicate_headers(detect_table_headers(grid))
             for sheet_name, grid in load_sheets(path).items()
         }
     except FileNotFoundError as error:
         raise StoredDocumentFileError(str(error)) from error
     except ValueError as error:
         raise InvalidDocumentFileError(str(error)) from error
+
+
+def _deduplicate_headers(headers: list[DetectedHeader]) -> list[DetectedHeader]:
+    # The header detector returns one entry per row that looks like a header,
+    # so an all-string data row (contact lists, address books) gets emitted as
+    # a second "table" sharing the same title cell. Drop those repeats — they
+    # bloat the deterministic fingerprint with data values and break schema
+    # matching. Dedup by title_coordinate so distinct tables (different title
+    # cells) survive; untitled tables aren't deduped because there's no key.
+    seen_title_coordinates: set[str] = set()
+    deduplicated: list[DetectedHeader] = []
+
+    for header in headers:
+        title_coordinate = header.get("title_coordinate")
+        if title_coordinate:
+            if title_coordinate in seen_title_coordinates:
+                continue
+            seen_title_coordinates.add(title_coordinate)
+        deduplicated.append(header)
+
+    return deduplicated
 
 
 def _flatten_workbook(path: Path) -> str:
@@ -460,6 +593,10 @@ async def _mark_document_failed(
         {"_id": document_id},
         {
             "$set": {"status": "failed", "failure_reason": reason},
-            "$unset": {"confidence": ""},
+            "$unset": {
+                "confidence": "",
+                "fingerprint": "",
+                "matched_schema_id": "",
+            },
         },
     )

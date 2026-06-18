@@ -120,10 +120,28 @@ export default function App() {
 
     try {
       const result = await detectDocumentHeaders(uploadResult.id);
-      const nextSections = buildSectionsFromDetection(result.detected_headers);
       setDetectionResult(result);
       setApprovalError("");
       setApprovalResult(null);
+      setUploadResult((currentResult) =>
+        currentResult ? { ...currentResult, status: result.status } : currentResult,
+      );
+
+      if (result.source === "schema") {
+        setApprovalResult({
+          status: result.status,
+          schema_id: result.matched_schema_id,
+          matched_schema_id: result.matched_schema_id,
+          fingerprint: result.fingerprint,
+        });
+        setSections([]);
+        setSelectedSectionId("");
+        setSelectedHeaderId("");
+        setIsReviewLoaded(false);
+        return;
+      }
+
+      const nextSections = buildSectionsFromDetection(result.detected_headers);
       setSections(nextSections);
       setSelectedSectionId(nextSections[0]?.id ?? "");
       setSelectedHeaderId(nextSections[0]?.headers[0]?.id ?? "");
@@ -347,6 +365,7 @@ export default function App() {
           }}
           onSubmit={handleUpload}
           selectedFile={selectedFile}
+          detectionResult={detectionResult}
           uploadError={uploadError}
           uploadResult={uploadResult}
         />
@@ -388,6 +407,7 @@ function UploadAndLoadReview({
   selectedFile,
   uploadResult,
   uploadError,
+  detectionResult,
   isUploading,
   detectionError,
   isDetecting,
@@ -443,6 +463,12 @@ function UploadAndLoadReview({
           edit the returned schema draft.
         </p>
         {detectionError ? <p className="error-message">{detectionError}</p> : null}
+        {detectionResult?.source === "schema" ? (
+          <p className="success-message">
+            Known schema matched: {detectionResult.matched_schema_id}. No human review
+            needed.
+          </p>
+        ) : null}
         <button
           className="secondary-button"
           disabled={!uploadResult || isDetecting}
