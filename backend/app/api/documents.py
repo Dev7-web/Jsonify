@@ -24,6 +24,18 @@ from ..pipeline.detect import (
     UnsupportedDocumentTypeError,
     detect_document_headers,
 )
+from ..pipeline.extract import (
+    ExtractDocumentNotFoundError,
+    ExtractInvalidDocumentFileError,
+    ExtractLocatorError,
+    ExtractMissingSchemaLinkError,
+    ExtractOutputNotFoundError,
+    ExtractSchemaNotFoundError,
+    ExtractStoredDocumentFileError,
+    ExtractUnsupportedDocumentTypeError,
+    extract_document_json,
+    get_document_output_json,
+)
 
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -72,6 +84,20 @@ class DocumentApproveHeadersResponse(BaseModel):
     schema_id: str
     matched_schema_id: str
     fingerprint: str
+
+
+class DocumentExtractResponse(BaseModel):
+    id: str
+    status: DocumentStatus
+    schema_id: str
+    output_json: dict[str, Any]
+    locators_created: bool
+
+
+class DocumentJsonResponse(BaseModel):
+    id: str
+    status: DocumentStatus
+    output_json: dict[str, Any]
 
 
 def get_file_type(filename: str) -> FileType:
@@ -237,3 +263,64 @@ async def approve_headers(
         ) from error
 
     return DocumentApproveHeadersResponse(**result)
+
+
+@router.post("/{document_id}/extract", response_model=DocumentExtractResponse)
+async def extract_json(document_id: str) -> DocumentExtractResponse:
+    try:
+        result = await extract_document_json(document_id)
+    except ExtractDocumentNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except ExtractSchemaNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except ExtractUnsupportedDocumentTypeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except ExtractMissingSchemaLinkError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+    except ExtractInvalidDocumentFileError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except ExtractLocatorError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except ExtractStoredDocumentFileError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        ) from error
+
+    return DocumentExtractResponse(**result)
+
+
+@router.get("/{document_id}/json", response_model=DocumentJsonResponse)
+async def get_json(document_id: str) -> DocumentJsonResponse:
+    try:
+        result = await get_document_output_json(document_id)
+    except ExtractDocumentNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except ExtractOutputNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+
+    return DocumentJsonResponse(**result)
