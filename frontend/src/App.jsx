@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import {
   approveDocumentHeaders,
   detectDocumentHeaders,
+  extractDocumentJson,
+  getDocumentJson,
   getHealth,
   uploadDocument,
 } from "./api";
@@ -26,6 +28,10 @@ export default function App() {
   const [approvalError, setApprovalError] = useState("");
   const [approvalResult, setApprovalResult] = useState(null);
   const [isApproving, setIsApproving] = useState(false);
+  const [extractionError, setExtractionError] = useState("");
+  const [extractionResult, setExtractionResult] = useState(null);
+  const [isDownloadingJson, setIsDownloadingJson] = useState(false);
+  const [isExtracting, setIsExtracting] = useState(false);
   const [isReviewLoaded, setIsReviewLoaded] = useState(false);
   const [schemaName, setSchemaName] = useState(DEFAULT_SCHEMA_NAME);
   const [sections, setSections] = useState([]);
@@ -57,12 +63,13 @@ export default function App() {
       id: uploadResult?.id ?? "",
       name: selectedFile?.name ?? "Uploaded document",
       status:
+        extractionResult?.status ??
         approvalResult?.status ??
         detectionResult?.status ??
         uploadResult?.status ??
         "uploaded",
     };
-  }, [approvalResult, detectionResult, selectedFile, uploadResult]);
+  }, [approvalResult, detectionResult, extractionResult, selectedFile, uploadResult]);
 
   const selectedSection = sections.find((section) => section.id === selectedSectionId);
   const selectedHeader = selectedSection?.headers.find(
@@ -92,6 +99,8 @@ export default function App() {
       setDetectionResult(null);
       setApprovalError("");
       setApprovalResult(null);
+      setExtractionError("");
+      setExtractionResult(null);
       setSchemaName(getDefaultSchemaName(selectedFile.name));
       setSections([]);
       setSelectedSectionId("");
@@ -117,6 +126,8 @@ export default function App() {
 
     setIsDetecting(true);
     setDetectionError("");
+    setExtractionError("");
+    setExtractionResult(null);
 
     try {
       const result = await detectDocumentHeaders(uploadResult.id);
@@ -193,6 +204,8 @@ export default function App() {
         name: trimmedSchemaName,
       });
       setApprovalResult(result);
+      setExtractionError("");
+      setExtractionResult(null);
       setUploadResult((currentResult) =>
         currentResult ? { ...currentResult, status: result.status } : currentResult,
       );
@@ -206,9 +219,67 @@ export default function App() {
     }
   }
 
+  async function extractJson() {
+    if (!uploadResult) {
+      setExtractionError("Upload and approve an .xlsx document before extraction.");
+      return;
+    }
+
+    if (!canExtractDocument(activeDocument)) {
+      setExtractionError("Approve headers before extracting the final JSON.");
+      return;
+    }
+
+    setIsExtracting(true);
+    setExtractionError("");
+
+    try {
+      const result = await extractDocumentJson(uploadResult.id);
+      setExtractionResult(result);
+      setUploadResult((currentResult) =>
+        currentResult ? { ...currentResult, status: result.status } : currentResult,
+      );
+      setDetectionResult((currentResult) =>
+        currentResult ? { ...currentResult, status: result.status } : currentResult,
+      );
+      setApprovalResult((currentResult) =>
+        currentResult ? { ...currentResult, status: result.status } : currentResult,
+      );
+    } catch (error) {
+      setExtractionError(error.message);
+    } finally {
+      setIsExtracting(false);
+    }
+  }
+
+  async function downloadJson() {
+    if (!uploadResult) {
+      setExtractionError("Extract JSON before downloading it.");
+      return;
+    }
+
+    setIsDownloadingJson(true);
+    setExtractionError("");
+
+    try {
+      const result = await getDocumentJson(uploadResult.id);
+      setExtractionResult((currentResult) => ({
+        ...(currentResult ?? {}),
+        ...result,
+      }));
+      saveJsonFile(result.output_json, getJsonDownloadName(activeDocument.name));
+    } catch (error) {
+      setExtractionError(error.message);
+    } finally {
+      setIsDownloadingJson(false);
+    }
+  }
+
   function clearSavedApproval() {
     setApprovalResult(null);
     setApprovalError("");
+    setExtractionError("");
+    setExtractionResult(null);
     setDetectionResult((currentResult) =>
       currentResult ? { ...currentResult, status: "needs_review" } : currentResult,
     );
@@ -312,6 +383,31 @@ export default function App() {
     );
   }
 
+  function approveSectionHeaders(sectionId) {
+    clearSavedApproval();
+    setSections((currentSections) =>
+      currentSections.map((section) => {
+        if (section.id !== sectionId || section.type === "ignored") {
+          return section;
+        }
+
+        return {
+          ...section,
+          headers: section.headers.map((header) => ({
+            ...header,
+            approvalStatus: "approved",
+            approved: true,
+            subheaders: header.subheaders?.map((subheader) => ({
+              ...subheader,
+              approvalStatus: "approved",
+              approved: true,
+            })),
+          })),
+        };
+      }),
+    );
+  }
+
   function addHeader() {
     const nextHeader = {
       id: `header-${Date.now()}`,
@@ -357,6 +453,8 @@ export default function App() {
             setDetectionResult(null);
             setApprovalError("");
             setApprovalResult(null);
+            setExtractionError("");
+            setExtractionResult(null);
             setSchemaName(getDefaultSchemaName(file?.name));
             setSections([]);
             setSelectedSectionId("");
@@ -366,6 +464,13 @@ export default function App() {
           onSubmit={handleUpload}
           selectedFile={selectedFile}
           detectionResult={detectionResult}
+          document={activeDocument}
+          extractionError={extractionError}
+          extractionResult={extractionResult}
+          isDownloadingJson={isDownloadingJson}
+          isExtracting={isExtracting}
+          onDownloadJson={downloadJson}
+          onExtractJson={extractJson}
           uploadError={uploadError}
           uploadResult={uploadResult}
         />
@@ -377,15 +482,22 @@ export default function App() {
           detectionResult={detectionResult}
           document={activeDocument}
           isApproving={isApproving}
+          extractionError={extractionError}
+          extractionResult={extractionResult}
+          isDownloadingJson={isDownloadingJson}
+          isExtracting={isExtracting}
           onAddHeader={addHeader}
           onAddSection={addSection}
           onApprove={approveHeaders}
           onBack={() => setIsReviewLoaded(false)}
+          onDownloadJson={downloadJson}
+          onExtractJson={extractJson}
           onRemoveHeader={removeHeader}
           onRemoveSection={removeSelectedSection}
           onSchemaNameChange={updateSchemaName}
           onSectionChange={updateSelectedSection}
           onHeaderApprovalChange={setHeaderReviewStatus}
+          onSectionApprove={approveSectionHeaders}
           onSelectHeader={setSelectedHeaderId}
           onSelectSection={selectSection}
           onUpdateHeader={updateHeader}
@@ -408,9 +520,16 @@ function UploadAndLoadReview({
   uploadResult,
   uploadError,
   detectionResult,
+  document,
+  extractionError,
+  extractionResult,
   isUploading,
   detectionError,
   isDetecting,
+  isDownloadingJson,
+  isExtracting,
+  onDownloadJson,
+  onExtractJson,
   onSelectedFileChange,
   onSubmit,
   onLoadReview,
@@ -478,6 +597,18 @@ function UploadAndLoadReview({
           {isDetecting ? "Detecting headers..." : "Load detected headers"}
         </button>
       </div>
+
+      {uploadResult && (canExtractDocument(document) || extractionResult) ? (
+        <ExtractionPanel
+          document={document}
+          error={extractionError}
+          extractionResult={extractionResult}
+          isDownloading={isDownloadingJson}
+          isExtracting={isExtracting}
+          onDownload={onDownloadJson}
+          onExtract={onExtractJson}
+        />
+      ) : null}
     </section>
   );
 }
@@ -487,6 +618,8 @@ function HeaderReviewScreen({
   detectionResult,
   approvalError,
   approvalResult,
+  extractionError,
+  extractionResult,
   sections,
   selectedSection,
   selectedSectionId,
@@ -495,8 +628,12 @@ function HeaderReviewScreen({
   schemaName,
   approvalPayload,
   isApproving,
+  isDownloadingJson,
+  isExtracting,
   onBack,
   onApprove,
+  onDownloadJson,
+  onExtractJson,
   onSelectSection,
   onSelectHeader,
   onSectionChange,
@@ -507,6 +644,7 @@ function HeaderReviewScreen({
   onRemoveHeader,
   onSchemaNameChange,
   onHeaderApprovalChange,
+  onSectionApprove,
   reviewProgress,
 }) {
   const canApproveSchema =
@@ -557,6 +695,7 @@ function HeaderReviewScreen({
 
       <div className="review-grid">
         <SectionList
+          onApproveSection={onSectionApprove}
           onSelect={onSelectSection}
           sections={sections}
           selectedSectionId={selectedSectionId}
@@ -613,6 +752,14 @@ function HeaderReviewScreen({
                 <button className="button-secondary-small" onClick={onAddHeader} type="button">
                   Add header
                 </button>
+                <button
+                  className="button-success-small"
+                  disabled={!canApproveSection(selectedSection)}
+                  onClick={() => onSectionApprove(selectedSection.id)}
+                  type="button"
+                >
+                  Approve section
+                </button>
               </div>
 
               <div className="headers-list">
@@ -649,6 +796,16 @@ function HeaderReviewScreen({
         />
       </div>
 
+      <ExtractionPanel
+        document={document}
+        error={extractionError}
+        extractionResult={extractionResult}
+        isDownloading={isDownloadingJson}
+        isExtracting={isExtracting}
+        onDownload={onDownloadJson}
+        onExtract={onExtractJson}
+      />
+
       <footer className="review-footer">
         <div className="approval-feedback" aria-live="polite">
           <button className="button-secondary" onClick={onBack} type="button">
@@ -674,6 +831,74 @@ function HeaderReviewScreen({
               : "Approve headers"}
         </button>
       </footer>
+    </section>
+  );
+}
+
+function ExtractionPanel({
+  document,
+  error,
+  extractionResult,
+  isDownloading,
+  isExtracting,
+  onDownload,
+  onExtract,
+}) {
+  const canExtract = canExtractDocument(document);
+  const hasJson = Boolean(extractionResult?.output_json);
+
+  return (
+    <section className="panel extraction-panel" aria-labelledby="extraction-title">
+      <div className="panel-heading panel-heading-row">
+        <div>
+          <p className="eyebrow">Extraction</p>
+          <h2 id="extraction-title">Final JSON</h2>
+        </div>
+        <StatusChip status={document.status} />
+      </div>
+
+      <p className="panel-copy">
+        Run extraction after approval to save the final JSON on this document.
+      </p>
+
+      {error ? <p className="error-message">{error}</p> : null}
+
+      <div className="extraction-actions">
+        <button
+          className="primary-button"
+          disabled={!canExtract || isExtracting}
+          onClick={onExtract}
+          type="button"
+        >
+          {isExtracting ? "Extracting JSON..." : hasJson ? "Run extraction again" : "Extract JSON"}
+        </button>
+        <button
+          className="button-secondary"
+          disabled={!hasJson || isDownloading}
+          onClick={onDownload}
+          type="button"
+        >
+          {isDownloading ? "Preparing download..." : "Download JSON"}
+        </button>
+      </div>
+
+      {!canExtract ? (
+        <p className="muted-message">Approve headers before running extraction.</p>
+      ) : null}
+
+      {hasJson ? (
+        <div className="json-result">
+          <div className="json-result-header">
+            <strong>Stored output JSON</strong>
+            <span>
+              {extractionResult.schema_id
+                ? `Schema ${extractionResult.schema_id}`
+                : "Fetched from document output_json"}
+            </span>
+          </div>
+          <pre>{JSON.stringify(extractionResult.output_json, null, 2)}</pre>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -767,6 +992,42 @@ function isApprovedHeader(header) {
 
 function isUnapprovedHeader(header) {
   return header.approvalStatus === "unapproved";
+}
+
+function canApproveSection(section) {
+  return (
+    section?.type !== "ignored" &&
+    Array.isArray(section?.headers) &&
+    section.headers.length > 0 &&
+    !section.headers.every(isApprovedHeader)
+  );
+}
+
+function canExtractDocument(document) {
+  return document?.status === "approved" || document?.status === "extracted";
+}
+
+function saveJsonFile(outputJson, fileName) {
+  const blob = new Blob([JSON.stringify(outputJson, null, 2)], {
+    type: "application/json",
+  });
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+function getJsonDownloadName(documentName) {
+  const baseName = String(documentName || "document")
+    .replace(/\.[^.]+$/, "")
+    .trim();
+
+  return `${baseName || "document"}.json`;
 }
 
 function buildSectionsFromDetection(detectedHeaders) {

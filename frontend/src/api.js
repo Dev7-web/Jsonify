@@ -63,3 +63,31 @@ export async function approveDocumentHeaders(documentId, payload) {
 
   return data;
 }
+
+export async function extractDocumentJson(documentId) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/extract`, {
+    method: "POST",
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail ?? `JSON extraction failed with status ${response.status}`,
+    );
+  }
+
+  return data;
+}
+
+export async function getDocumentJson(documentId) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/json`);
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.detail ?? `JSON fetch failed with status ${response.status}`);
+  }
+
+  return data;
+}

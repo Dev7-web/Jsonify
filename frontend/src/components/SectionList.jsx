@@ -19,7 +19,12 @@ function getSectionStatus(section) {
   return "needs_review";
 }
 
-export default function SectionList({ sections, selectedSectionId, onSelect }) {
+export default function SectionList({
+  sections,
+  selectedSectionId,
+  onSelect,
+  onApproveSection,
+}) {
   return (
     <aside className="panel section-list">
       <div className="panel-heading">
@@ -29,21 +34,36 @@ export default function SectionList({ sections, selectedSectionId, onSelect }) {
 
       <div className="section-stack">
         {sections.map((section) => (
-          <button
+          <div
             className={
               selectedSectionId === section.id
                 ? "section-card section-card--selected"
                 : "section-card"
             }
             key={section.id}
-            onClick={() => onSelect(section.id)}
-            type="button"
           >
-            <div className="section-card-top">
-              <strong>{section.title}</strong>
-              <StatusChip status={getSectionStatus(section)} />
-            </div>
-          </button>
+            <button
+              className="section-card-select"
+              onClick={() => onSelect(section.id)}
+              type="button"
+            >
+              <div className="section-card-top">
+                <strong>{section.title}</strong>
+                <StatusChip status={getSectionStatus(section)} />
+              </div>
+            </button>
+            {canApproveSection(section) ? (
+              <div className="section-card-actions">
+                <button
+                  className="button-success-small"
+                  onClick={() => onApproveSection(section.id)}
+                  type="button"
+                >
+                  Approve section
+                </button>
+              </div>
+            ) : null}
+          </div>
         ))}
       </div>
     </aside>
@@ -56,4 +76,12 @@ function isApprovedHeader(header) {
 
 function isUnapprovedHeader(header) {
   return header.approvalStatus === "unapproved";
+}
+
+function canApproveSection(section) {
+  return (
+    section.type !== "ignored" &&
+    section.headers.length > 0 &&
+    !section.headers.every(isApprovedHeader)
+  );
 }
