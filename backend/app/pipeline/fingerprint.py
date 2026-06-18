@@ -18,6 +18,9 @@ DEFAULT_SCHEMA_MATCH_THRESHOLD = 0.70
 DEFAULT_MIN_JACCARD = 0.45
 DEFAULT_MIN_SCHEMA_COVERAGE = 0.55
 DEFAULT_MIN_OVERLAP_LABELS = 6
+DEFAULT_MIN_STRONG_SCHEMA_COVERAGE = 0.82
+DEFAULT_MIN_STRONG_SCHEMA_OVERLAP = 12
+DEFAULT_MIN_STRONG_SCHEMA_CANDIDATE_COVERAGE = 0.30
 
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
@@ -120,6 +123,11 @@ def find_best_schema_match(
     min_jaccard: float = DEFAULT_MIN_JACCARD,
     min_schema_coverage: float = DEFAULT_MIN_SCHEMA_COVERAGE,
     min_overlap_labels: int = DEFAULT_MIN_OVERLAP_LABELS,
+    min_strong_schema_coverage: float = DEFAULT_MIN_STRONG_SCHEMA_COVERAGE,
+    min_strong_schema_overlap: int = DEFAULT_MIN_STRONG_SCHEMA_OVERLAP,
+    min_strong_schema_candidate_coverage: float = (
+        DEFAULT_MIN_STRONG_SCHEMA_CANDIDATE_COVERAGE
+    ),
 ) -> SchemaMatch | None:
     best_match: SchemaMatch | None = None
 
@@ -143,11 +151,20 @@ def find_best_schema_match(
             continue
 
         is_high_jaccard_match = similarity.jaccard >= min_jaccard
-        is_strong_containment_match = (
+        is_strong_candidate_containment_match = (
             similarity.candidate_coverage >= 0.98
             and similarity.schema_coverage >= min_schema_coverage
         )
-        if not is_high_jaccard_match and not is_strong_containment_match:
+        is_strong_schema_coverage_match = (
+            similarity.schema_coverage >= min_strong_schema_coverage
+            and similarity.candidate_coverage >= min_strong_schema_candidate_coverage
+            and similarity.overlap_count >= min_strong_schema_overlap
+        )
+        if (
+            not is_high_jaccard_match
+            and not is_strong_candidate_containment_match
+            and not is_strong_schema_coverage_match
+        ):
             continue
 
         if _is_better_match(similarity, best_match):
@@ -165,6 +182,11 @@ async def match_schema_by_fingerprint(
     min_jaccard: float = DEFAULT_MIN_JACCARD,
     min_schema_coverage: float = DEFAULT_MIN_SCHEMA_COVERAGE,
     min_overlap_labels: int = DEFAULT_MIN_OVERLAP_LABELS,
+    min_strong_schema_coverage: float = DEFAULT_MIN_STRONG_SCHEMA_COVERAGE,
+    min_strong_schema_overlap: int = DEFAULT_MIN_STRONG_SCHEMA_OVERLAP,
+    min_strong_schema_candidate_coverage: float = (
+        DEFAULT_MIN_STRONG_SCHEMA_CANDIDATE_COVERAGE
+    ),
 ) -> SchemaMatch | None:
     database = db if db is not None else get_db()
 
@@ -186,6 +208,9 @@ async def match_schema_by_fingerprint(
         min_jaccard=min_jaccard,
         min_schema_coverage=min_schema_coverage,
         min_overlap_labels=min_overlap_labels,
+        min_strong_schema_coverage=min_strong_schema_coverage,
+        min_strong_schema_overlap=min_strong_schema_overlap,
+        min_strong_schema_candidate_coverage=min_strong_schema_candidate_coverage,
     )
 
 
