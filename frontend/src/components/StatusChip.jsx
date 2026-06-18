@@ -1,4 +1,5 @@
 const LABELS = {
+  approved: "Approved",
   needs_review: "Needs review",
   ready: "Ready",
   low_confidence: "Low confidence",

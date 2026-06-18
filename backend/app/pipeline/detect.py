@@ -120,7 +120,11 @@ async def detect_document_headers(
             header_structure,
             deterministic_headers,
         )
-        confidence = 0.65 if flags else 0.8
+        confidence = calculate_detection_confidence(
+            flags,
+            header_structure,
+            deterministic_headers,
+        )
 
         detection_result: DetectionResult = {
             "source": "llm",
@@ -158,25 +162,23 @@ def compare_with_deterministic_headers(
 ) -> list[DetectionFlag]:
     flags: list[DetectionFlag] = []
     llm_tables_by_sheet = _get_llm_table_sections_by_sheet(header_structure)
+    matched_llm_table_keys: set[tuple[str, str]] = set()
 
     # ponytail: repeated/nested deterministic headers would otherwise emit
     # one flag per occurrence. Track what we've already flagged.
     emitted_missing_tables: set[tuple[str, str]] = set()
     emitted_missing_columns: set[tuple[str, str, str]] = set()
+    emitted_unmatched_llm_tables: set[tuple[str, str]] = set()
 
     for sheet_name, detected_tables in deterministic_headers.items():
         llm_tables = llm_tables_by_sheet.get(sheet_name, [])
-        llm_tables_by_title = {
-            _normalize_label(table["title"]): table
-            for table in llm_tables
-            if table.get("title")
-        }
 
         for detected_table in detected_tables:
             title = detected_table.get("title")
             normalized_title = _normalize_label(title or "")
+            matched_llm_table = _find_matching_llm_table(detected_table, llm_tables)
 
-            if not normalized_title or normalized_title not in llm_tables_by_title:
+            if matched_llm_table is None:
                 key = (sheet_name, normalized_title)
                 if key in emitted_missing_tables:
                     continue
@@ -192,9 +194,9 @@ def compare_with_deterministic_headers(
                 )
                 continue
 
-            llm_header_names = _collect_header_names(
-                llm_tables_by_title[normalized_title].get("headers", [])
-            )
+            matched_llm_table_keys.add((sheet_name, _get_llm_table_key(matched_llm_table)))
+
+            llm_header_names = _collect_header_names(matched_llm_table.get("headers", []))
             for column in detected_table["columns"]:
                 normalized_column = _normalize_label(column["name"])
                 if normalized_column in llm_header_names:
@@ -218,22 +220,15 @@ def compare_with_deterministic_headers(
                     }
                 )
 
-    deterministic_titles_by_sheet = {
-        sheet_name: {
-            _normalize_label(header["title"] or "")
-            for header in headers
-            if header.get("title")
-        }
-        for sheet_name, headers in deterministic_headers.items()
-    }
-
     for sheet_name, llm_tables in llm_tables_by_sheet.items():
-        deterministic_titles = deterministic_titles_by_sheet.get(sheet_name, set())
         for table in llm_tables:
-            title = table.get("title")
-            normalized_title = _normalize_label(title or "")
-            if normalized_title and normalized_title in deterministic_titles:
+            if (sheet_name, _get_llm_table_key(table)) in matched_llm_table_keys:
                 continue
+
+            unmatched_key = (sheet_name, _normalize_label(table.get("title") or ""))
+            if unmatched_key in emitted_unmatched_llm_tables:
+                continue
+            emitted_unmatched_llm_tables.add(unmatched_key)
 
             flags.append(
                 {
@@ -248,6 +243,49 @@ def compare_with_deterministic_headers(
             )
 
     return flags
+
+
+def calculate_detection_confidence(
+    flags: list[DetectionFlag],
+    header_structure: HeaderStructure,
+    deterministic_headers: dict[str, list[DetectedHeader]],
+) -> float:
+    if not flags:
+        return 0.8
+
+    deterministic_table_count = sum(len(tables) for tables in deterministic_headers.values())
+    deterministic_column_count = sum(
+        len(table["columns"])
+        for tables in deterministic_headers.values()
+        for table in tables
+    )
+    llm_table_count = sum(
+        1
+        for sheet in header_structure["sheets"]
+        for section in sheet["sections"]
+        if section.get("type") == "table"
+    )
+
+    flag_counts = _count_flags_by_type(flags)
+    table_missing_ratio = _ratio(
+        flag_counts.get("deterministic_table_missing", 0),
+        deterministic_table_count,
+    )
+    column_missing_ratio = _ratio(
+        flag_counts.get("deterministic_column_missing", 0),
+        deterministic_column_count,
+    )
+    llm_unmatched_ratio = _ratio(
+        flag_counts.get("llm_table_not_in_prescan", 0),
+        llm_table_count,
+    )
+
+    penalty = (
+        min(0.16, table_missing_ratio * 0.16)
+        + min(0.12, column_missing_ratio * 0.12)
+        + min(0.08, llm_unmatched_ratio * 0.08)
+    )
+    return round(max(0.5, 0.8 - penalty), 2)
 
 
 def _ensure_xlsx_document(document: Document) -> None:
@@ -310,6 +348,53 @@ def _get_llm_table_sections_by_sheet(
     return tables_by_sheet
 
 
+def _find_matching_llm_table(
+    detected_table: DetectedHeader,
+    llm_tables: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    normalized_title = _normalize_label(detected_table.get("title") or "")
+    if normalized_title:
+        for table in llm_tables:
+            if _normalize_label(table.get("title") or "") == normalized_title:
+                return table
+
+    detected_column_names = {
+        _normalize_label(column["name"])
+        for column in detected_table["columns"]
+        if _normalize_label(column["name"])
+    }
+    if not detected_column_names:
+        return None
+
+    best_table: dict[str, Any] | None = None
+    best_score = 0.0
+
+    for table in llm_tables:
+        llm_header_names = _collect_header_names(table.get("headers", []))
+        if not llm_header_names:
+            continue
+
+        overlap_count = len(detected_column_names & llm_header_names)
+        if overlap_count < 2:
+            continue
+
+        score = overlap_count / min(len(detected_column_names), len(llm_header_names))
+        if score > best_score:
+            best_table = table
+            best_score = score
+
+    if best_score < 0.5:
+        return None
+
+    return best_table
+
+
+def _get_llm_table_key(table: dict[str, Any]) -> str:
+    title = _normalize_label(table.get("title") or "")
+    header_names = sorted(_collect_header_names(table.get("headers", [])))
+    return f"{title}|{'|'.join(header_names)}"
+
+
 def _collect_header_names(headers: Any) -> set[str]:
     names: set[str] = set()
 
@@ -331,6 +416,21 @@ def _collect_header_names(headers: Any) -> set[str]:
 
 def _normalize_label(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _count_flags_by_type(flags: list[DetectionFlag]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for flag in flags:
+        flag_type = flag["type"]
+        counts[flag_type] = counts.get(flag_type, 0) + 1
+    return counts
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+
+    return min(1.0, numerator / denominator)
 
 
 def _format_missing_table_message(sheet_name: str, title: str | None) -> str:

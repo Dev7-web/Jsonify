@@ -43,3 +43,23 @@ export async function detectDocumentHeaders(documentId) {
 
   return data;
 }
+
+export async function approveDocumentHeaders(documentId, payload) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/approve-headers`, {
+    body: JSON.stringify(payload),
+    headers: {
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail ?? `Header approval failed with status ${response.status}`,
+    );
+  }
+
+  return data;
+}

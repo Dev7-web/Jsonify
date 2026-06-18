@@ -4,12 +4,18 @@ from uuid import uuid4
 
 import aiofiles
 from fastapi import APIRouter, HTTPException, UploadFile, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..db import get_db
 from ..llm.client import LLMCallError, LLMConfigurationError
 from ..llm.header_prompt import HeaderStructureParseError
 from ..models import Document, DocumentStatus, FileType
+from ..pipeline.approve import (
+    ApproveDocumentNotFoundError,
+    InvalidApprovedHeadersError,
+    SchemaPersistenceError,
+    approve_document_headers,
+)
 from ..pipeline.detect import (
     DetectionInProgressError,
     DocumentNotFoundError,
@@ -50,6 +56,19 @@ class DocumentDetectHeadersResponse(BaseModel):
     status: DocumentStatus
     confidence: float
     detected_headers: dict[str, Any]
+
+
+class DocumentApproveHeadersRequest(BaseModel):
+    name: str = Field(min_length=1)
+    header_structure: dict[str, Any]
+
+
+class DocumentApproveHeadersResponse(BaseModel):
+    id: str
+    status: DocumentStatus
+    schema_id: str
+    matched_schema_id: str
+    fingerprint: str
 
 
 def get_file_type(filename: str) -> FileType:
@@ -185,3 +204,33 @@ async def detect_headers(document_id: str) -> DocumentDetectHeadersResponse:
         ) from error
 
     return DocumentDetectHeadersResponse(**result)
+
+
+@router.post("/{document_id}/approve-headers", response_model=DocumentApproveHeadersResponse)
+async def approve_headers(
+    document_id: str,
+    payload: DocumentApproveHeadersRequest,
+) -> DocumentApproveHeadersResponse:
+    try:
+        result = await approve_document_headers(
+            document_id,
+            name=payload.name,
+            header_structure=payload.header_structure,
+        )
+    except ApproveDocumentNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except InvalidApprovedHeadersError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except SchemaPersistenceError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        ) from error
+
+    return DocumentApproveHeadersResponse(**result)

@@ -144,6 +144,7 @@ select:focus {
 }
 
 .upload-form button:disabled,
+.primary-button:disabled,
 .secondary-button:disabled,
 .button-danger-small:disabled {
   background: #cbd5e1;
@@ -190,6 +191,15 @@ select:focus {
   border: 1px solid #fecaca;
   border-radius: 8px;
   color: #dc2626;
+  margin: 0;
+  padding: 12px 14px;
+}
+
+.success-message {
+  background: #dcfce7;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  color: #16a34a;
   margin: 0;
   padding: 12px 14px;
 }
@@ -353,6 +363,7 @@ select:focus {
   color: #d97706;
 }
 
+.status-chip--approved,
 .status-chip--ready {
   background: #dcfce7;
   color: #16a34a;
@@ -527,6 +538,14 @@ select:focus {
 .review-footer {
   border-top: 1px solid #d7dee8;
   padding-top: 16px;
+}
+
+.approval-feedback {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
 }
 
 @media (max-width: 1180px) {

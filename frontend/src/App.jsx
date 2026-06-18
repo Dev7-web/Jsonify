@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { detectDocumentHeaders, getHealth, uploadDocument } from "./api";
+import {
+  approveDocumentHeaders,
+  detectDocumentHeaders,
+  getHealth,
+  uploadDocument,
+} from "./api";
 import HeaderEditor from "./components/HeaderEditor";
 import HeaderRow from "./components/HeaderRow";
 import SchemaNamePanel from "./components/SchemaNamePanel";
@@ -18,6 +23,9 @@ export default function App() {
   const [detectionError, setDetectionError] = useState("");
   const [isDetecting, setIsDetecting] = useState(false);
   const [detectionResult, setDetectionResult] = useState(null);
+  const [approvalError, setApprovalError] = useState("");
+  const [approvalResult, setApprovalResult] = useState(null);
+  const [isApproving, setIsApproving] = useState(false);
   const [isReviewLoaded, setIsReviewLoaded] = useState(false);
   const [schemaName, setSchemaName] = useState(DEFAULT_SCHEMA_NAME);
   const [sections, setSections] = useState([]);
@@ -48,13 +56,17 @@ export default function App() {
     return {
       id: uploadResult?.id ?? "",
       name: selectedFile?.name ?? "Uploaded document",
-      status: detectionResult?.status ?? uploadResult?.status ?? "uploaded",
+      status:
+        approvalResult?.status ??
+        detectionResult?.status ??
+        uploadResult?.status ??
+        "uploaded",
       confidence:
         detectionResult?.confidence != null
           ? Math.round(detectionResult.confidence * 100)
           : 0,
     };
-  }, [detectionResult, selectedFile, uploadResult]);
+  }, [approvalResult, detectionResult, selectedFile, uploadResult]);
 
   const selectedSection = sections.find((section) => section.id === selectedSectionId);
   const selectedHeader = selectedSection?.headers.find(
@@ -81,6 +93,8 @@ export default function App() {
       setUploadResult(result);
       setDetectionError("");
       setDetectionResult(null);
+      setApprovalError("");
+      setApprovalResult(null);
       setSchemaName(getDefaultSchemaName(selectedFile.name));
       setSections([]);
       setSelectedSectionId("");
@@ -111,6 +125,8 @@ export default function App() {
       const result = await detectDocumentHeaders(uploadResult.id);
       const nextSections = buildSectionsFromDetection(result.detected_headers);
       setDetectionResult(result);
+      setApprovalError("");
+      setApprovalResult(null);
       setSections(nextSections);
       setSelectedSectionId(nextSections[0]?.id ?? "");
       setSelectedHeaderId(nextSections[0]?.headers[0]?.id ?? "");
@@ -119,6 +135,40 @@ export default function App() {
       setDetectionError(error.message);
     } finally {
       setIsDetecting(false);
+    }
+  }
+
+  async function approveHeaders() {
+    if (!uploadResult) {
+      setApprovalError("Upload and detect an .xlsx document before approval.");
+      return;
+    }
+
+    const trimmedSchemaName = schemaName.trim();
+    if (!trimmedSchemaName) {
+      setApprovalError("Schema name must not be empty.");
+      return;
+    }
+
+    setIsApproving(true);
+    setApprovalError("");
+
+    try {
+      const result = await approveDocumentHeaders(uploadResult.id, {
+        ...approvalPayload,
+        name: trimmedSchemaName,
+      });
+      setApprovalResult(result);
+      setUploadResult((currentResult) =>
+        currentResult ? { ...currentResult, status: result.status } : currentResult,
+      );
+      setDetectionResult((currentResult) =>
+        currentResult ? { ...currentResult, status: result.status } : currentResult,
+      );
+    } catch (error) {
+      setApprovalError(error.message);
+    } finally {
+      setIsApproving(false);
     }
   }
 
@@ -225,6 +275,8 @@ export default function App() {
             setUploadResult(null);
             setDetectionError("");
             setDetectionResult(null);
+            setApprovalError("");
+            setApprovalResult(null);
             setSchemaName(getDefaultSchemaName(file?.name));
             setSections([]);
             setSelectedSectionId("");
@@ -239,10 +291,14 @@ export default function App() {
       ) : (
         <HeaderReviewScreen
           approvalPayload={approvalPayload}
+          approvalError={approvalError}
+          approvalResult={approvalResult}
           detectionResult={detectionResult}
           document={activeDocument}
+          isApproving={isApproving}
           onAddHeader={addHeader}
           onAddSection={addSection}
+          onApprove={approveHeaders}
           onBack={() => setIsReviewLoaded(false)}
           onRemoveHeader={removeHeader}
           onRemoveSection={removeSelectedSection}
@@ -339,6 +395,8 @@ function UploadAndLoadReview({
 function HeaderReviewScreen({
   document,
   detectionResult,
+  approvalError,
+  approvalResult,
   sections,
   selectedSection,
   selectedSectionId,
@@ -346,7 +404,9 @@ function HeaderReviewScreen({
   selectedHeaderId,
   schemaName,
   approvalPayload,
+  isApproving,
   onBack,
+  onApprove,
   onSelectSection,
   onSelectHeader,
   onSectionChange,
@@ -366,7 +426,7 @@ function HeaderReviewScreen({
           <p>{document.name}</p>
         </div>
         <div className="review-header-status">
-          <StatusChip status="needs_review" />
+          <StatusChip status={document.status} />
           {detectionResult?.detected_headers?.flags?.length ? (
             <span>{detectionResult.detected_headers.flags.length} review flags</span>
           ) : null}
@@ -466,11 +526,28 @@ function HeaderReviewScreen({
       </div>
 
       <footer className="review-footer">
-        <button className="button-secondary" onClick={onBack} type="button">
-          Back to upload
-        </button>
-        <button className="primary-button" type="button">
-          Ready to submit later
+        <div className="approval-feedback" aria-live="polite">
+          <button className="button-secondary" onClick={onBack} type="button">
+            Back to upload
+          </button>
+          {approvalError ? <p className="error-message">{approvalError}</p> : null}
+          {approvalResult ? (
+            <p className="success-message">
+              Schema approved: {approvalResult.schema_id}
+            </p>
+          ) : null}
+        </div>
+        <button
+          className="primary-button"
+          disabled={isApproving || Boolean(approvalResult)}
+          onClick={onApprove}
+          type="button"
+        >
+          {approvalResult
+            ? "Schema approved"
+            : isApproving
+              ? "Approving..."
+              : "Approve headers"}
         </button>
       </footer>
     </section>
@@ -587,6 +664,8 @@ function buildKeyValueHeaders(fields, confidence) {
 }
 
 function buildTableHeaders(headers, deterministicTable, flags, context) {
+  const baseConfidence = Math.round(context.confidence * 100);
+
   return headers.map((header, index) => {
     const deterministicColumn = deterministicTable?.columns?.find(
       (column) => normalizeLabel(column.name) === normalizeLabel(header.name),
@@ -603,12 +682,12 @@ function buildTableHeaders(headers, deterministicTable, flags, context) {
       id: createId(`${context.sheetName}-${context.title}-${header.name}-${index}`),
       name: header.name,
       coordinate: deterministicColumn?.coordinate ?? "",
-      confidence: isFlagged ? 62 : Math.round(context.confidence * 100),
+      confidence: isFlagged ? getFlaggedConfidence(baseConfidence, 12) : baseConfidence,
       subheaders: header.subheaders?.map((subheader, subIndex) => ({
         id: createId(`${context.sheetName}-${context.title}-${header.name}-${subheader.name}-${subIndex}`),
         name: subheader.name,
         coordinate: "",
-        confidence: Math.round(context.confidence * 100),
+        confidence: baseConfidence,
       })),
     };
   });
@@ -619,13 +698,18 @@ function findDeterministicTable(tables, title) {
 }
 
 function getSectionConfidence(confidence, flags, sheetName, title) {
+  const baseConfidence = Math.round(confidence * 100);
   const hasFlag = flags.some(
     (flag) =>
       normalizeLabel(flag.sheet) === normalizeLabel(sheetName) &&
       normalizeLabel(flag.title ?? "") === normalizeLabel(title),
   );
 
-  return hasFlag ? 65 : Math.round(confidence * 100);
+  return hasFlag ? getFlaggedConfidence(baseConfidence, 10) : baseConfidence;
+}
+
+function getFlaggedConfidence(baseConfidence, penalty) {
+  return Math.max(50, Math.min(68, baseConfidence - penalty));
 }
 
 function normalizeLabel(value) {
