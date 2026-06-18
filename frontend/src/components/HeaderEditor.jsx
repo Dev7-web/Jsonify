@@ -1,11 +1,24 @@
-import ConfidenceBar from "./ConfidenceBar";
 import StatusChip from "./StatusChip";
 
 function getHeaderStatus(header) {
-  return header?.confidence < 70 ? "low_confidence" : "ready";
+  if (isApprovedHeader(header)) {
+    return "approved";
+  }
+
+  if (isUnapprovedHeader(header)) {
+    return "unapproved";
+  }
+
+  return "needs_review";
 }
 
-export default function HeaderEditor({ header, onChange, onRemove, onAdd }) {
+export default function HeaderEditor({
+  header,
+  onChange,
+  onRemove,
+  onAdd,
+  onApprovalChange,
+}) {
   if (!header) {
     return (
       <aside className="panel editor-panel">
@@ -20,6 +33,14 @@ export default function HeaderEditor({ header, onChange, onRemove, onAdd }) {
     );
   }
 
+  const approved = isApprovedHeader(header);
+  const unapproved = isUnapprovedHeader(header);
+  const approvalLabel = approved
+    ? "Header approved"
+    : unapproved
+      ? "Header unapproved"
+      : "Header needs approval";
+
   return (
     <aside className="panel editor-panel">
       <div className="panel-heading panel-heading-row">
@@ -30,7 +51,40 @@ export default function HeaderEditor({ header, onChange, onRemove, onAdd }) {
         <StatusChip status={getHeaderStatus(header)} />
       </div>
 
-      <ConfidenceBar value={header.confidence} />
+      <div className="header-approval-panel">
+        <div>
+          <strong>{approvalLabel}</strong>
+        </div>
+        <div className="header-editor-review-actions">
+          {approved || unapproved ? (
+            <button
+              className="button-secondary-small"
+              onClick={() => onApprovalChange(header.id, "pending")}
+              type="button"
+            >
+              Reopen
+            </button>
+          ) : null}
+          {!approved ? (
+            <button
+              className="button-success-small"
+              onClick={() => onApprovalChange(header.id, "approved")}
+              type="button"
+            >
+              Approve header
+            </button>
+          ) : null}
+          {!unapproved ? (
+            <button
+              className="button-danger-small"
+              onClick={() => onApprovalChange(header.id, "unapproved")}
+              type="button"
+            >
+              Unapprove
+            </button>
+          ) : null}
+        </div>
+      </div>
 
       <label className="field">
         <span>Header name</span>
@@ -54,10 +108,23 @@ export default function HeaderEditor({ header, onChange, onRemove, onAdd }) {
         <button className="button button-secondary" onClick={onAdd} type="button">
           Add header
         </button>
-        <button className="button button-danger" onClick={() => onRemove(header.id)} type="button">
-          Remove
+        <button
+          className="button button-danger"
+          disabled={unapproved}
+          onClick={() => onRemove(header.id)}
+          type="button"
+        >
+          Unapprove
         </button>
       </div>
     </aside>
   );
+}
+
+function isApprovedHeader(header) {
+  return header?.approvalStatus === "approved" || (!header?.approvalStatus && header?.approved);
+}
+
+function isUnapprovedHeader(header) {
+  return header?.approvalStatus === "unapproved";
 }

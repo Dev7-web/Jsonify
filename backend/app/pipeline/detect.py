@@ -225,7 +225,8 @@ def compare_with_deterministic_headers(
             if (sheet_name, _get_llm_table_key(table)) in matched_llm_table_keys:
                 continue
 
-            unmatched_key = (sheet_name, _normalize_label(table.get("title") or ""))
+            title = table.get("title")
+            unmatched_key = (sheet_name, _normalize_label(title or ""))
             if unmatched_key in emitted_unmatched_llm_tables:
                 continue
             emitted_unmatched_llm_tables.add(unmatched_key)

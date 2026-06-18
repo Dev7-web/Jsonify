@@ -61,10 +61,6 @@ export default function App() {
         detectionResult?.status ??
         uploadResult?.status ??
         "uploaded",
-      confidence:
-        detectionResult?.confidence != null
-          ? Math.round(detectionResult.confidence * 100)
-          : 0,
     };
   }, [approvalResult, detectionResult, selectedFile, uploadResult]);
 
@@ -72,6 +68,7 @@ export default function App() {
   const selectedHeader = selectedSection?.headers.find(
     (header) => header.id === selectedHeaderId,
   );
+  const reviewProgress = useMemo(() => getReviewProgress(sections), [sections]);
   const approvalPayload = useMemo(
     () => buildApprovalPayload(schemaName, sections),
     [schemaName, sections],
@@ -150,6 +147,25 @@ export default function App() {
       return;
     }
 
+    if (reviewProgress.total === 0) {
+      setApprovalError("Add at least one included header before saving the schema.");
+      return;
+    }
+
+    if (reviewProgress.pending > 0) {
+      setApprovalError(
+        `Resolve ${reviewProgress.pending} pending header${
+          reviewProgress.pending === 1 ? "" : "s"
+        } by approving or unapproving them before saving the schema.`,
+      );
+      return;
+    }
+
+    if (reviewProgress.approved === 0) {
+      setApprovalError("Approve at least one header before saving the schema.");
+      return;
+    }
+
     setIsApproving(true);
     setApprovalError("");
 
@@ -172,6 +188,17 @@ export default function App() {
     }
   }
 
+  function clearSavedApproval() {
+    setApprovalResult(null);
+    setApprovalError("");
+    setDetectionResult((currentResult) =>
+      currentResult ? { ...currentResult, status: "needs_review" } : currentResult,
+    );
+    setUploadResult((currentResult) =>
+      currentResult ? { ...currentResult, status: "needs_review" } : currentResult,
+    );
+  }
+
   function selectSection(sectionId) {
     const nextSection = sections.find((section) => section.id === sectionId);
     setSelectedSectionId(sectionId);
@@ -179,6 +206,7 @@ export default function App() {
   }
 
   function updateSelectedSection(changes) {
+    clearSavedApproval();
     setSections((currentSections) =>
       currentSections.map((section) =>
         section.id === selectedSectionId ? { ...section, ...changes } : section,
@@ -191,10 +219,10 @@ export default function App() {
       id: `section-${Date.now()}`,
       title: "New Section",
       type: "table",
-      confidence: 100,
       headers: [],
     };
 
+    clearSavedApproval();
     setSections((currentSections) => [...currentSections, nextSection]);
     setSelectedSectionId(nextSection.id);
     setSelectedHeaderId("");
@@ -206,12 +234,14 @@ export default function App() {
     }
 
     const remainingSections = sections.filter((section) => section.id !== selectedSectionId);
+    clearSavedApproval();
     setSections(remainingSections);
     setSelectedSectionId(remainingSections[0].id);
     setSelectedHeaderId(remainingSections[0].headers[0]?.id ?? "");
   }
 
   function updateHeader(headerId, changes) {
+    clearSavedApproval();
     setSections((currentSections) =>
       currentSections.map((section) => {
         if (section.id !== selectedSectionId) {
@@ -221,7 +251,43 @@ export default function App() {
         return {
           ...section,
           headers: section.headers.map((header) =>
-            header.id === headerId ? { ...header, ...changes } : header,
+            header.id === headerId
+              ? {
+                  ...header,
+                  ...changes,
+                  approved: false,
+                  approvalStatus: "pending",
+                }
+              : header,
+          ),
+        };
+      }),
+    );
+  }
+
+  function setHeaderReviewStatus(headerId, approvalStatus) {
+    clearSavedApproval();
+    setSections((currentSections) =>
+      currentSections.map((section) => {
+        if (section.id !== selectedSectionId) {
+          return section;
+        }
+
+        return {
+          ...section,
+          headers: section.headers.map((header) =>
+            header.id === headerId
+              ? {
+                  ...header,
+                  approvalStatus,
+                  approved: approvalStatus === "approved",
+                  subheaders: header.subheaders?.map((subheader) => ({
+                    ...subheader,
+                    approvalStatus,
+                    approved: approvalStatus === "approved",
+                  })),
+                }
+              : header,
           ),
         };
       }),
@@ -233,9 +299,11 @@ export default function App() {
       id: `header-${Date.now()}`,
       name: "New Header",
       coordinate: "",
-      confidence: 100,
+      approved: false,
+      approvalStatus: "pending",
     };
 
+    clearSavedApproval();
     setSections((currentSections) =>
       currentSections.map((section) =>
         section.id === selectedSectionId
@@ -247,17 +315,12 @@ export default function App() {
   }
 
   function removeHeader(headerId) {
-    const remainingHeaders =
-      selectedSection?.headers.filter((header) => header.id !== headerId) ?? [];
+    setHeaderReviewStatus(headerId, "unapproved");
+  }
 
-    setSections((currentSections) =>
-      currentSections.map((section) =>
-        section.id === selectedSectionId
-          ? { ...section, headers: remainingHeaders }
-          : section,
-      ),
-    );
-    setSelectedHeaderId(remainingHeaders[0]?.id ?? "");
+  function updateSchemaName(nextSchemaName) {
+    clearSavedApproval();
+    setSchemaName(nextSchemaName);
   }
 
   return (
@@ -302,11 +365,13 @@ export default function App() {
           onBack={() => setIsReviewLoaded(false)}
           onRemoveHeader={removeHeader}
           onRemoveSection={removeSelectedSection}
-          onSchemaNameChange={setSchemaName}
+          onSchemaNameChange={updateSchemaName}
           onSectionChange={updateSelectedSection}
+          onHeaderApprovalChange={setHeaderReviewStatus}
           onSelectHeader={setSelectedHeaderId}
           onSelectSection={selectSection}
           onUpdateHeader={updateHeader}
+          reviewProgress={reviewProgress}
           schemaName={schemaName}
           sections={sections}
           selectedHeader={selectedHeader}
@@ -416,7 +481,15 @@ function HeaderReviewScreen({
   onAddHeader,
   onRemoveHeader,
   onSchemaNameChange,
+  onHeaderApprovalChange,
+  reviewProgress,
 }) {
+  const canApproveSchema =
+    reviewProgress.total > 0 && reviewProgress.pending === 0 && reviewProgress.approved > 0;
+  const selectedSectionCounts = selectedSection
+    ? getHeaderReviewCounts(selectedSection.headers)
+    : null;
+
   return (
     <section className="review-shell" aria-labelledby="review-title">
       <header className="review-header">
@@ -426,9 +499,33 @@ function HeaderReviewScreen({
           <p>{document.name}</p>
         </div>
         <div className="review-header-status">
-          <StatusChip status={document.status} />
-          {detectionResult?.detected_headers?.flags?.length ? (
-            <span>{detectionResult.detected_headers.flags.length} review flags</span>
+          <div className="review-status-line">
+            <StatusChip status={document.status} />
+            {detectionResult?.detected_headers?.flags?.length ? (
+              <span className="review-flag-count">
+                {detectionResult.detected_headers.flags.length} review flags
+              </span>
+            ) : null}
+          </div>
+          <p className="approval-progress">
+            {reviewProgress.reviewed}/{reviewProgress.total} reviewed ·{" "}
+            {reviewProgress.approved} approved · {reviewProgress.unapproved} unapproved
+          </p>
+          <button
+            className="primary-button"
+            disabled={isApproving || Boolean(approvalResult) || !canApproveSchema}
+            onClick={onApprove}
+            type="button"
+          >
+            {approvalResult
+              ? "Schema approved"
+              : isApproving
+                ? "Approving..."
+                : "Approve headers"}
+          </button>
+          {approvalError ? <p className="inline-error">{approvalError}</p> : null}
+          {approvalResult ? (
+            <p className="inline-success">Schema approved: {approvalResult.schema_id}</p>
           ) : null}
         </div>
       </header>
@@ -487,7 +584,19 @@ function HeaderReviewScreen({
               </div>
 
               <div className="headers-toolbar">
-                <strong>{selectedSection.headers.length} headers</strong>
+                <strong>
+                  {selectedSection.headers.length} headers
+                  {selectedSection.type !== "ignored" && selectedSectionCounts ? (
+                    <>
+                      {" "}
+                      · {selectedSectionCounts.approved} approved
+                      {" "}
+                      · {selectedSectionCounts.unapproved} unapproved
+                      {" "}
+                      · {selectedSectionCounts.pending} pending
+                    </>
+                  ) : null}
+                </strong>
                 <button className="button-secondary-small" onClick={onAddHeader} type="button">
                   Add header
                 </button>
@@ -499,6 +608,7 @@ function HeaderReviewScreen({
                     <HeaderRow
                       header={header}
                       key={header.id}
+                      onApprovalChange={onHeaderApprovalChange}
                       onSelect={onSelectHeader}
                       selected={selectedHeaderId === header.id}
                     />
@@ -514,6 +624,7 @@ function HeaderReviewScreen({
         <HeaderEditor
           header={selectedHeader}
           onAdd={onAddHeader}
+          onApprovalChange={onHeaderApprovalChange}
           onChange={onUpdateHeader}
           onRemove={onRemoveHeader}
         />
@@ -539,7 +650,7 @@ function HeaderReviewScreen({
         </div>
         <button
           className="primary-button"
-          disabled={isApproving || Boolean(approvalResult)}
+          disabled={isApproving || Boolean(approvalResult) || !canApproveSchema}
           onClick={onApprove}
           type="button"
         >
@@ -555,12 +666,44 @@ function HeaderReviewScreen({
 }
 
 function buildApprovalPayload(schemaName, sections) {
-  const includedSections = sections.filter((section) => section.type !== "ignored");
-  const sectionsBySheet = includedSections.reduce((groups, section) => {
+  const sectionsBySheet = sections.reduce((groups, section) => {
+    if (section.type === "ignored") {
+      return groups;
+    }
+
+    const approvedHeaders = section.headers.filter(isApprovedHeader);
+    if (!approvedHeaders.length) {
+      return groups;
+    }
+
     const sheetName = section.sheetName || "Workbook";
+    const approvedSection =
+      section.type === "key_value"
+        ? {
+            type: section.type,
+            title: section.title,
+            fields: approvedHeaders.map((header) => header.name),
+          }
+        : {
+            type: section.type,
+            title: section.title,
+            headers: approvedHeaders.map((header) => {
+              const approvedSubheaders = header.subheaders?.filter(isApprovedHeader) ?? [];
+              const approvedHeader = { name: header.name };
+
+              if (approvedSubheaders.length) {
+                approvedHeader.subheaders = approvedSubheaders.map((subheader) => ({
+                  name: subheader.name,
+                }));
+              }
+
+              return approvedHeader;
+            }),
+          };
+
     return {
       ...groups,
-      [sheetName]: [...(groups[sheetName] ?? []), section],
+      [sheetName]: [...(groups[sheetName] ?? []), approvedSection],
     };
   }, {});
 
@@ -569,36 +712,53 @@ function buildApprovalPayload(schemaName, sections) {
     header_structure: {
       sheets: Object.entries(sectionsBySheet).map(([sheetName, sheetSections]) => ({
         name: sheetName,
-        sections: sheetSections.map((section) => {
-            if (section.type === "key_value") {
-              return {
-                type: section.type,
-                title: section.title,
-                fields: section.headers.map((header) => header.name),
-              };
-            }
-
-            return {
-              type: section.type,
-              title: section.title,
-              headers: section.headers.map((header) => ({
-                name: header.name,
-                subheaders: header.subheaders?.map((subheader) => ({
-                  name: subheader.name,
-                })),
-              })),
-            };
-          }),
+        sections: sheetSections,
       })),
     },
   };
 }
 
+function getReviewProgress(sections) {
+  const reviewableHeaders = sections
+    .filter((section) => section.type !== "ignored")
+    .flatMap((section) => section.headers);
+
+  const counts = getHeaderReviewCounts(reviewableHeaders);
+
+  return {
+    ...counts,
+    reviewed: counts.approved + counts.unapproved,
+    total: reviewableHeaders.length,
+    remaining: counts.pending,
+  };
+}
+
+function countApprovedHeaders(headers) {
+  return headers.filter(isApprovedHeader).length;
+}
+
+function getHeaderReviewCounts(headers) {
+  const approved = countApprovedHeaders(headers);
+  const unapproved = headers.filter(isUnapprovedHeader).length;
+
+  return {
+    approved,
+    unapproved,
+    pending: headers.length - approved - unapproved,
+  };
+}
+
+function isApprovedHeader(header) {
+  return header.approvalStatus === "approved" || (!header.approvalStatus && header.approved);
+}
+
+function isUnapprovedHeader(header) {
+  return header.approvalStatus === "unapproved";
+}
+
 function buildSectionsFromDetection(detectedHeaders) {
   const headerStructure = detectedHeaders?.header_structure;
   const deterministicHeaders = detectedHeaders?.deterministic_headers ?? {};
-  const confidence = detectedHeaders?.confidence ?? 0.8;
-  const flags = detectedHeaders?.flags ?? [];
   const sections = [];
 
   headerStructure?.sheets?.forEach((sheet) => {
@@ -614,14 +774,12 @@ function buildSectionsFromDetection(detectedHeaders) {
         sheetName: sheet.name,
         title,
         type: section.type,
-        confidence: getSectionConfidence(confidence, flags, sheet.name, title),
         headers:
           section.type === "key_value"
-            ? buildKeyValueHeaders(section.fields ?? [], confidence)
-            : buildTableHeaders(section.headers ?? [], deterministicTable, flags, {
+            ? buildKeyValueHeaders(section.fields ?? [])
+            : buildTableHeaders(section.headers ?? [], deterministicTable, {
                 sheetName: sheet.name,
                 title,
-                confidence,
               }),
       });
     });
@@ -638,12 +796,12 @@ function buildSectionsFromDetection(detectedHeaders) {
         sheetName,
         title: table.title || "Untitled table",
         type: "table",
-        confidence: Math.round(confidence * 100),
         headers: table.columns.map((column) => ({
           id: createId(`${sheetName}-${table.title}-${column.name}`),
           name: column.name,
           coordinate: column.coordinate,
-          confidence: Math.round(confidence * 100),
+          approved: false,
+          approvalStatus: "pending",
         })),
       });
     });
@@ -652,42 +810,36 @@ function buildSectionsFromDetection(detectedHeaders) {
   return sections;
 }
 
-function buildKeyValueHeaders(fields, confidence) {
-  const value = Math.round(confidence * 100);
-
+function buildKeyValueHeaders(fields) {
   return fields.map((field, index) => ({
     id: createId(`${field}-${index}`),
     name: field,
     coordinate: "",
-    confidence: value,
+    approved: false,
+    approvalStatus: "pending",
   }));
 }
 
-function buildTableHeaders(headers, deterministicTable, flags, context) {
-  const baseConfidence = Math.round(context.confidence * 100);
-
+function buildTableHeaders(headers, deterministicTable, context) {
   return headers.map((header, index) => {
     const deterministicColumn = deterministicTable?.columns?.find(
       (column) => normalizeLabel(column.name) === normalizeLabel(header.name),
-    );
-    const isFlagged = flags.some(
-      (flag) =>
-        flag.type === "deterministic_column_missing" &&
-        normalizeLabel(flag.sheet) === normalizeLabel(context.sheetName) &&
-        normalizeLabel(flag.title ?? "") === normalizeLabel(context.title) &&
-        normalizeLabel(flag.column ?? "") === normalizeLabel(header.name),
     );
 
     return {
       id: createId(`${context.sheetName}-${context.title}-${header.name}-${index}`),
       name: header.name,
       coordinate: deterministicColumn?.coordinate ?? "",
-      confidence: isFlagged ? getFlaggedConfidence(baseConfidence, 12) : baseConfidence,
+      approved: false,
+      approvalStatus: "pending",
       subheaders: header.subheaders?.map((subheader, subIndex) => ({
-        id: createId(`${context.sheetName}-${context.title}-${header.name}-${subheader.name}-${subIndex}`),
+        id: createId(
+          `${context.sheetName}-${context.title}-${header.name}-${subheader.name}-${subIndex}`,
+        ),
         name: subheader.name,
         coordinate: "",
-        confidence: baseConfidence,
+        approved: false,
+        approvalStatus: "pending",
       })),
     };
   });
@@ -695,21 +847,6 @@ function buildTableHeaders(headers, deterministicTable, flags, context) {
 
 function findDeterministicTable(tables, title) {
   return tables.find((table) => normalizeLabel(table.title ?? "") === normalizeLabel(title));
-}
-
-function getSectionConfidence(confidence, flags, sheetName, title) {
-  const baseConfidence = Math.round(confidence * 100);
-  const hasFlag = flags.some(
-    (flag) =>
-      normalizeLabel(flag.sheet) === normalizeLabel(sheetName) &&
-      normalizeLabel(flag.title ?? "") === normalizeLabel(title),
-  );
-
-  return hasFlag ? getFlaggedConfidence(baseConfidence, 10) : baseConfidence;
-}
-
-function getFlaggedConfidence(baseConfidence, penalty) {
-  return Math.max(50, Math.min(68, baseConfidence - penalty));
 }
 
 function normalizeLabel(value) {

@@ -1,4 +1,3 @@
-import ConfidenceBar from "./ConfidenceBar";
 import StatusChip from "./StatusChip";
 
 function getSectionStatus(section) {
@@ -6,7 +5,18 @@ function getSectionStatus(section) {
     return "ignored";
   }
 
-  return section.confidence < 70 ? "low_confidence" : "ready";
+  if (section.headers.length > 0 && section.headers.every(isApprovedHeader)) {
+    return "approved";
+  }
+
+  if (
+    section.headers.length > 0 &&
+    section.headers.every((header) => isApprovedHeader(header) || isUnapprovedHeader(header))
+  ) {
+    return "reviewed";
+  }
+
+  return "needs_review";
 }
 
 export default function SectionList({ sections, selectedSectionId, onSelect }) {
@@ -35,11 +45,18 @@ export default function SectionList({ sections, selectedSectionId, onSelect }) {
             </div>
             <div className="section-card-meta">
               <span>{section.type}</span>
-              <ConfidenceBar value={section.confidence} />
             </div>
           </button>
         ))}
       </div>
     </aside>
   );
+}
+
+function isApprovedHeader(header) {
+  return header.approvalStatus === "approved" || (!header.approvalStatus && header.approved);
+}
+
+function isUnapprovedHeader(header) {
+  return header.approvalStatus === "unapproved";
 }
