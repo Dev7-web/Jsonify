@@ -401,8 +401,7 @@ select:focus {
   outline: none;
 }
 
-.section-card-top,
-.section-card-meta {
+.section-card-top {
   align-items: center;
   display: flex;
   gap: 10px;
@@ -412,16 +411,6 @@ select:focus {
 .section-card-top strong {
   font-size: 14px;
   line-height: 1.3;
-}
-
-.section-card-meta {
-  margin-top: 10px;
-}
-
-.section-card-meta > span {
-  color: #64748b;
-  font-size: 12px;
-  font-weight: 800;
 }
 
 .status-chip {
@@ -491,7 +480,7 @@ select:focus {
   border-radius: 8px;
   display: grid;
   gap: 12px;
-  grid-template-columns: minmax(0, 1fr) 180px;
+  grid-template-columns: minmax(0, 1fr);
   padding: 12px;
 }
 
@@ -509,7 +498,7 @@ select:focus {
   align-items: center;
   display: grid;
   gap: 10px;
-  grid-template-columns: minmax(170px, 1fr) 70px auto minmax(150px, auto);
+  grid-template-columns: minmax(170px, 1fr) auto minmax(150px, auto);
 }
 
 .header-name {
@@ -517,12 +506,6 @@ select:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.coordinate {
-  color: #64748b;
-  font-size: 13px;
-  font-weight: 800;
 }
 
 .subheader-list {
@@ -540,7 +523,7 @@ select:focus {
   border-radius: 8px;
   display: grid;
   gap: 10px;
-  grid-template-columns: minmax(120px, 1fr) 70px;
+  grid-template-columns: minmax(120px, 1fr);
   padding: 9px 10px;
 }
 

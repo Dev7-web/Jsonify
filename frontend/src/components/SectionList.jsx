@@ -43,9 +43,6 @@ export default function SectionList({ sections, selectedSectionId, onSelect }) {
               <strong>{section.title}</strong>
               <StatusChip status={getSectionStatus(section)} />
             </div>
-            <div className="section-card-meta">
-              <span>{section.type}</span>
-            </div>
           </button>
         ))}
       </div>

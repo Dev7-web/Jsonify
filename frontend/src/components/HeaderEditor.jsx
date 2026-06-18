@@ -95,15 +95,6 @@ export default function HeaderEditor({
         />
       </label>
 
-      <label className="field">
-        <span>Cell coordinate</span>
-        <input
-          onChange={(event) => onChange(header.id, { coordinate: event.target.value })}
-          type="text"
-          value={header.coordinate}
-        />
-      </label>
-
       <div className="editor-actions">
         <button className="button button-secondary" onClick={onAdd} type="button">
           Add header

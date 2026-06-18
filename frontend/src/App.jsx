@@ -298,7 +298,6 @@ export default function App() {
     const nextHeader = {
       id: `header-${Date.now()}`,
       name: "New Header",
-      coordinate: "",
       approved: false,
       approvalStatus: "pending",
     };
@@ -569,18 +568,6 @@ function HeaderReviewScreen({
                     value={selectedSection.title}
                   />
                 </label>
-
-                <label className="field">
-                  <span>Section type</span>
-                  <select
-                    onChange={(event) => onSectionChange({ type: event.target.value })}
-                    value={selectedSection.type}
-                  >
-                    <option value="key_value">key_value</option>
-                    <option value="table">table</option>
-                    <option value="ignored">ignored</option>
-                  </select>
-                </label>
               </div>
 
               <div className="headers-toolbar">
@@ -764,10 +751,6 @@ function buildSectionsFromDetection(detectedHeaders) {
   headerStructure?.sheets?.forEach((sheet) => {
     sheet.sections?.forEach((section, sectionIndex) => {
       const title = section.title || `${sheet.name} section ${sectionIndex + 1}`;
-      const deterministicTable = findDeterministicTable(
-        deterministicHeaders[sheet.name] ?? [],
-        title,
-      );
 
       sections.push({
         id: createId(`${sheet.name}-${title}-${sectionIndex}`),
@@ -777,7 +760,7 @@ function buildSectionsFromDetection(detectedHeaders) {
         headers:
           section.type === "key_value"
             ? buildKeyValueHeaders(section.fields ?? [])
-            : buildTableHeaders(section.headers ?? [], deterministicTable, {
+            : buildTableHeaders(section.headers ?? [], {
                 sheetName: sheet.name,
                 title,
               }),
@@ -799,7 +782,6 @@ function buildSectionsFromDetection(detectedHeaders) {
         headers: table.columns.map((column) => ({
           id: createId(`${sheetName}-${table.title}-${column.name}`),
           name: column.name,
-          coordinate: column.coordinate,
           approved: false,
           approvalStatus: "pending",
         })),
@@ -814,22 +796,16 @@ function buildKeyValueHeaders(fields) {
   return fields.map((field, index) => ({
     id: createId(`${field}-${index}`),
     name: field,
-    coordinate: "",
     approved: false,
     approvalStatus: "pending",
   }));
 }
 
-function buildTableHeaders(headers, deterministicTable, context) {
+function buildTableHeaders(headers, context) {
   return headers.map((header, index) => {
-    const deterministicColumn = deterministicTable?.columns?.find(
-      (column) => normalizeLabel(column.name) === normalizeLabel(header.name),
-    );
-
     return {
       id: createId(`${context.sheetName}-${context.title}-${header.name}-${index}`),
       name: header.name,
-      coordinate: deterministicColumn?.coordinate ?? "",
       approved: false,
       approvalStatus: "pending",
       subheaders: header.subheaders?.map((subheader, subIndex) => ({
@@ -837,16 +813,11 @@ function buildTableHeaders(headers, deterministicTable, context) {
           `${context.sheetName}-${context.title}-${header.name}-${subheader.name}-${subIndex}`,
         ),
         name: subheader.name,
-        coordinate: "",
         approved: false,
         approvalStatus: "pending",
       })),
     };
   });
-}
-
-function findDeterministicTable(tables, title) {
-  return tables.find((table) => normalizeLabel(table.title ?? "") === normalizeLabel(title));
 }
 
 function normalizeLabel(value) {

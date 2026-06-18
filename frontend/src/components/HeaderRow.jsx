@@ -46,7 +46,6 @@ export default function HeaderRow({ header, selected, onSelect, onApprovalChange
         tabIndex={0}
       >
         <span className="header-name">{header.name}</span>
-        <span className="coordinate">{header.coordinate}</span>
         <StatusChip status={getHeaderStatus(header)} />
         <div className="header-row-actions">
           {approved || unapproved ? (
@@ -96,7 +95,6 @@ export default function HeaderRow({ header, selected, onSelect, onApprovalChange
           {header.subheaders.map((subheader) => (
             <div className="subheader-row" key={subheader.id}>
               <span>{subheader.name}</span>
-              <span className="coordinate">{subheader.coordinate}</span>
             </div>
           ))}
         </div>
