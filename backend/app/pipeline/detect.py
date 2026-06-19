@@ -12,6 +12,7 @@ from app.llm.header_prompt import HeaderStructure, adetect_header_structure
 from app.models import Document
 from app.parsing.excel_loader import load_sheets
 from app.parsing.flatten import flatten_excel
+from app.parsing.form_detector import DetectedKeyValueSection, detect_key_value_sections
 from app.parsing.header_detector import DetectedHeader, detect_table_headers
 from app.pipeline.fingerprint import SchemaMatch
 from app.pipeline.fingerprint import build_deterministic_header_fingerprint
@@ -41,6 +42,7 @@ class DetectionResult(TypedDict, total=False):
     source: DetectionSource
     header_structure: HeaderStructure
     deterministic_headers: dict[str, list[DetectedHeader]]
+    deterministic_key_value_sections: dict[str, list[DetectedKeyValueSection]]
     flags: list[DetectionFlag]
     confidence: float
     match: dict[str, Any]
@@ -123,6 +125,9 @@ async def detect_document_headers(
     try:
         workbook_path = _resolve_stored_path(document.stored_path)
         deterministic_headers = _detect_deterministic_headers(workbook_path)
+        deterministic_key_value_sections = _detect_deterministic_key_value_sections(
+            workbook_path,
+        )
 
         schema_response = await _detect_known_schema(
             database,
@@ -134,6 +139,10 @@ async def detect_document_headers(
 
         flattened_text = _flatten_workbook(workbook_path)
         header_structure = await adetect_header_structure(flattened_text)
+        header_structure = apply_key_value_section_hints(
+            header_structure,
+            deterministic_key_value_sections,
+        )
 
         flags = compare_with_deterministic_headers(
             header_structure,
@@ -153,6 +162,7 @@ async def detect_document_headers(
             "source": "llm",
             "header_structure": header_structure,
             "deterministic_headers": deterministic_headers,
+            "deterministic_key_value_sections": deterministic_key_value_sections,
             "flags": flags,
             "confidence": confidence,
         }
@@ -436,6 +446,17 @@ def _detect_deterministic_headers(path: Path) -> dict[str, list[DetectedHeader]]
         raise InvalidDocumentFileError(str(error)) from error
 
 
+def _detect_deterministic_key_value_sections(
+    path: Path,
+) -> dict[str, list[DetectedKeyValueSection]]:
+    try:
+        return detect_key_value_sections(path)
+    except FileNotFoundError as error:
+        raise StoredDocumentFileError(str(error)) from error
+    except ValueError as error:
+        raise InvalidDocumentFileError(str(error)) from error
+
+
 def _deduplicate_headers(headers: list[DetectedHeader]) -> list[DetectedHeader]:
     # The header detector returns one entry per row that looks like a header,
     # so an all-string data row (contact lists, address books) gets emitted as
@@ -464,6 +485,107 @@ def _flatten_workbook(path: Path) -> str:
         raise StoredDocumentFileError(str(error)) from error
     except ValueError as error:
         raise InvalidDocumentFileError(str(error)) from error
+
+
+def apply_key_value_section_hints(
+    header_structure: HeaderStructure,
+    key_value_sections: dict[str, list[DetectedKeyValueSection]],
+) -> HeaderStructure:
+    sheets: list[dict[str, Any]] = []
+
+    for sheet in header_structure["sheets"]:
+        hints = key_value_sections.get(sheet["name"], [])
+        if not hints:
+            sheets.append(dict(sheet))
+            continue
+
+        hint_titles = {_normalize_label(hint["title"]) for hint in hints}
+        existing_titles = {
+            _normalize_label(section.get("title") or "")
+            for section in sheet["sections"]
+            if section.get("title")
+        }
+        if hint_titles.issubset(existing_titles):
+            sheets.append(dict(sheet))
+            continue
+
+        sheets.append(
+            {
+                "name": sheet["name"],
+                "sections": _apply_sheet_key_value_hints(sheet["sections"], hints),
+            }
+        )
+
+    return {"sheets": sheets}
+
+
+def _apply_sheet_key_value_hints(
+    sections: list[dict[str, Any]],
+    hints: list[DetectedKeyValueSection],
+) -> list[dict[str, Any]]:
+    hint_sections = [_key_value_hint_to_layout_section(hint) for hint in hints]
+    hint_titles = {_normalize_label(hint["title"]) for hint in hints}
+    output_sections: list[dict[str, Any]] = []
+    inserted_hints = False
+
+    for section in sections:
+        section_title = _normalize_label(section.get("title") or "")
+        if section_title in hint_titles:
+            continue
+
+        if not inserted_hints and _is_collapsed_key_value_section(section, hint_titles):
+            output_sections.extend(hint_sections)
+            inserted_hints = True
+            continue
+
+        output_sections.append(dict(section))
+
+    if not inserted_hints:
+        insert_index = _first_table_section_index(output_sections)
+        output_sections = [
+            *output_sections[:insert_index],
+            *hint_sections,
+            *output_sections[insert_index:],
+        ]
+
+    return output_sections
+
+
+def _key_value_hint_to_layout_section(
+    hint: DetectedKeyValueSection,
+) -> dict[str, Any]:
+    return {
+        "type": "key_value",
+        "title": hint["title"],
+        "fields": [field["name"] for field in hint["fields"]],
+    }
+
+
+def _is_collapsed_key_value_section(
+    section: dict[str, Any],
+    hint_titles: set[str],
+) -> bool:
+    if section.get("type") != "key_value":
+        return False
+
+    fields = section.get("fields", [])
+    if not isinstance(fields, list):
+        return False
+
+    matched_titles = {
+        _normalize_label(field)
+        for field in fields
+        if isinstance(field, str) and _normalize_label(field) in hint_titles
+    }
+    return len(matched_titles) >= min(2, len(hint_titles))
+
+
+def _first_table_section_index(sections: list[dict[str, Any]]) -> int:
+    for index, section in enumerate(sections):
+        if section.get("type") == "table":
+            return index
+
+    return len(sections)
 
 
 def _get_llm_table_sections_by_sheet(

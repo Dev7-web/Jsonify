@@ -59,8 +59,22 @@ FILE_TYPE_MAGIC_BYTES: dict[FileType, bytes] = {
 
 class DocumentCreateResponse(BaseModel):
     id: str
+    filename: str
     file_type: FileType
     status: DocumentStatus
+
+
+class DocumentResponse(BaseModel):
+    id: str
+    filename: str
+    file_type: FileType
+    status: DocumentStatus
+    detected_headers: dict[str, Any] | None = None
+    output_json: dict[str, Any] | None = None
+    confidence: float | None = None
+    fingerprint: str | None = None
+    matched_schema_id: str | None = None
+    failure_reason: str | None = None
 
 
 class DocumentDetectHeadersResponse(BaseModel):
@@ -187,8 +201,33 @@ async def create_document(file: UploadFile) -> DocumentCreateResponse:
 
     return DocumentCreateResponse(
         id=document.id,
+        filename=document.filename,
         file_type=document.file_type,
         status=document.status,
+    )
+
+
+@router.get("/{document_id}", response_model=DocumentResponse)
+async def get_document(document_id: str) -> DocumentResponse:
+    record = await get_db().documents.find_one({"_id": document_id})
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document not found: {document_id}",
+        )
+
+    document = Document.model_validate(record)
+    return DocumentResponse(
+        id=document.id,
+        filename=document.filename,
+        file_type=document.file_type,
+        status=document.status,
+        detected_headers=document.detected_headers,
+        output_json=document.output_json,
+        confidence=document.confidence,
+        fingerprint=document.fingerprint,
+        matched_schema_id=document.matched_schema_id,
+        failure_reason=document.failure_reason,
     )
 
 

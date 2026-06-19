@@ -44,6 +44,8 @@ Do not invent labels that are not present in the flattened workbook text.
 Represent form-style areas as type "key_value".
 Represent column-header tables as type "table".
 Use nested "subheaders" only when the workbook visually groups columns under a parent header.
+When form-style group titles appear inside a larger page title, each group title is
+its own key_value section. Do not put group titles inside another section's fields.
 """
 
 
@@ -82,6 +84,9 @@ Rules:
 - Include every sheet in the flattened workbook.
 - A sheet may have an empty "sections" array if it has no reusable layout headers.
 - For "key_value" sections, include only reusable label names in "fields"; do not include their values.
+- If a form area has visible group titles on the same row or nearby rows, each group title is a separate "key_value" section.
+- Do not use a larger page/report title as the section title when smaller group titles contain the actual field labels.
+- Do not include sibling group titles as fields. Example: if "Amendment Information" and "Lease Information" are group titles, they should be section titles, not fields under "Amendment Abstract".
 - For "table" sections, include column headers in left-to-right order.
 - If a section or table has no visible title in the cells, omit the "title" key; never return an empty title.
 - Preserve the exact sheet names from lines that start with "## Sheet:".

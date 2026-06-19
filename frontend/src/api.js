@@ -28,6 +28,18 @@ export async function uploadDocument(file) {
   return data;
 }
 
+export async function getDocument(documentId) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}`);
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.detail ?? `Document fetch failed with status ${response.status}`);
+  }
+
+  return data;
+}
+
 export async function detectDocumentHeaders(documentId) {
   const response = await fetch(`${API_BASE_URL}/documents/${documentId}/detect-headers`, {
     method: "POST",

@@ -3,6 +3,7 @@ import {
   approveDocumentHeaders,
   detectDocumentHeaders,
   extractDocumentJson,
+  getDocument,
   getDocumentJson,
   getHealth,
   uploadDocument,
@@ -15,6 +16,7 @@ import StatusChip from "./components/StatusChip";
 import "./styles.css";
 
 const DEFAULT_SCHEMA_NAME = "New layout schema";
+const DOCUMENT_REVIEW_PATH_PATTERN = /^\/documents\/([^/]+)\/review\/?$/;
 
 export default function App() {
   const [backendStatus, setBackendStatus] = useState("checking");
@@ -32,6 +34,8 @@ export default function App() {
   const [extractionResult, setExtractionResult] = useState(null);
   const [isDownloadingJson, setIsDownloadingJson] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
+  const [isRestoringDocument, setIsRestoringDocument] = useState(false);
+  const [restoreError, setRestoreError] = useState("");
   const [isReviewLoaded, setIsReviewLoaded] = useState(false);
   const [schemaName, setSchemaName] = useState(DEFAULT_SCHEMA_NAME);
   const [sections, setSections] = useState([]);
@@ -61,7 +65,7 @@ export default function App() {
   const activeDocument = useMemo(() => {
     return {
       id: uploadResult?.id ?? "",
-      name: selectedFile?.name ?? "Uploaded document",
+      name: selectedFile?.name ?? uploadResult?.filename ?? "Uploaded document",
       status:
         extractionResult?.status ??
         approvalResult?.status ??
@@ -70,6 +74,47 @@ export default function App() {
         "uploaded",
     };
   }, [approvalResult, detectionResult, extractionResult, selectedFile, uploadResult]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function syncDocumentFromUrl() {
+      const documentId = getDocumentIdFromUrl();
+      if (!documentId) {
+        if (isMounted) {
+          setIsReviewLoaded(false);
+          setRestoreError("");
+        }
+        return;
+      }
+
+      setIsRestoringDocument(true);
+      setRestoreError("");
+
+      try {
+        const document = await getDocument(documentId);
+        if (isMounted) {
+          hydrateStoredDocument(document);
+        }
+      } catch (error) {
+        if (isMounted) {
+          setRestoreError(error.message);
+        }
+      } finally {
+        if (isMounted) {
+          setIsRestoringDocument(false);
+        }
+      }
+    }
+
+    syncDocumentFromUrl();
+    window.addEventListener("popstate", syncDocumentFromUrl);
+
+    return () => {
+      isMounted = false;
+      window.removeEventListener("popstate", syncDocumentFromUrl);
+    };
+  }, []);
 
   const selectedSection = sections.find((section) => section.id === selectedSectionId);
   const selectedHeader = selectedSection?.headers.find(
@@ -95,6 +140,7 @@ export default function App() {
     try {
       const result = await uploadDocument(selectedFile);
       setUploadResult(result);
+      setDocumentReviewUrl(result.id);
       setDetectionError("");
       setDetectionResult(null);
       setApprovalError("");
@@ -131,6 +177,7 @@ export default function App() {
 
     try {
       const result = await detectDocumentHeaders(uploadResult.id);
+      setDocumentReviewUrl(uploadResult.id);
       setDetectionResult(result);
       setApprovalError("");
       setApprovalResult(null);
@@ -273,6 +320,31 @@ export default function App() {
     } finally {
       setIsDownloadingJson(false);
     }
+  }
+
+  function hydrateStoredDocument(document) {
+    const storedDetectionResult = buildDetectionResultFromDocument(document);
+    const storedExtractionResult = buildExtractionResultFromDocument(document);
+    const storedApprovalResult = buildApprovalResultFromDocument(document);
+    const shouldShowReview = shouldRestoreReviewScreen(document, storedDetectionResult);
+    const restoredSections = shouldShowReview
+      ? buildSectionsFromDetection(storedDetectionResult.detected_headers)
+      : [];
+
+    setSelectedFile(null);
+    setUploadResult(buildUploadResultFromDocument(document));
+    setUploadError("");
+    setDetectionError("");
+    setDetectionResult(storedDetectionResult);
+    setApprovalError("");
+    setApprovalResult(storedApprovalResult);
+    setExtractionError("");
+    setExtractionResult(storedExtractionResult);
+    setSchemaName(getDefaultSchemaName(document.filename));
+    setSections(restoredSections);
+    setSelectedSectionId(restoredSections[0]?.id ?? "");
+    setSelectedHeaderId(restoredSections[0]?.headers[0]?.id ?? "");
+    setIsReviewLoaded(shouldShowReview && restoredSections.length > 0);
   }
 
   function clearSavedApproval() {
@@ -438,21 +510,30 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      {!isReviewLoaded ? (
+      {isRestoringDocument ? (
+        <section className="status-panel" aria-labelledby="restore-title">
+          <p className="eyebrow">Document JSON Extractor</p>
+          <h1 id="restore-title">Loading document</h1>
+          <p className="status-line">Restoring saved review from MongoDB...</p>
+        </section>
+      ) : !isReviewLoaded ? (
         <UploadAndLoadReview
           backendStatus={backendStatus}
           isUploading={isUploading}
           detectionError={detectionError}
           isDetecting={isDetecting}
+          restoreError={restoreError}
           onLoadReview={loadReview}
           onSelectedFileChange={(file) => {
             setSelectedFile(file);
+            clearDocumentReviewUrl();
             setUploadError("");
             setUploadResult(null);
             setDetectionError("");
             setDetectionResult(null);
             setApprovalError("");
             setApprovalResult(null);
+            setRestoreError("");
             setExtractionError("");
             setExtractionResult(null);
             setSchemaName(getDefaultSchemaName(file?.name));
@@ -489,7 +570,10 @@ export default function App() {
           onAddHeader={addHeader}
           onAddSection={addSection}
           onApprove={approveHeaders}
-          onBack={() => setIsReviewLoaded(false)}
+          onBack={() => {
+            clearDocumentReviewUrl();
+            setIsReviewLoaded(false);
+          }}
           onDownloadJson={downloadJson}
           onExtractJson={extractJson}
           onRemoveHeader={removeHeader}
@@ -526,6 +610,7 @@ function UploadAndLoadReview({
   isUploading,
   detectionError,
   isDetecting,
+  restoreError,
   isDownloadingJson,
   isExtracting,
   onDownloadJson,
@@ -560,6 +645,12 @@ function UploadAndLoadReview({
         {uploadError ? <p className="error-message">{uploadError}</p> : null}
         {uploadResult ? (
           <dl className="result-list">
+            {uploadResult.filename ? (
+              <div>
+                <dt>filename</dt>
+                <dd>{uploadResult.filename}</dd>
+              </div>
+            ) : null}
             <div>
               <dt>id</dt>
               <dd>{uploadResult.id}</dd>
@@ -588,6 +679,7 @@ function UploadAndLoadReview({
             needed.
           </p>
         ) : null}
+        {restoreError ? <p className="error-message">{restoreError}</p> : null}
         <button
           className="secondary-button"
           disabled={!uploadResult || isDetecting}
@@ -1028,6 +1120,93 @@ function getJsonDownloadName(documentName) {
     .trim();
 
   return `${baseName || "document"}.json`;
+}
+
+function buildUploadResultFromDocument(document) {
+  return {
+    id: document.id,
+    filename: document.filename,
+    file_type: document.file_type,
+    status: document.status,
+  };
+}
+
+function buildDetectionResultFromDocument(document) {
+  if (!document.detected_headers) {
+    return null;
+  }
+
+  return {
+    id: document.id,
+    status: document.status,
+    source:
+      document.detected_headers.source ??
+      (document.matched_schema_id ? "schema" : "llm"),
+    confidence: document.confidence ?? document.detected_headers.confidence ?? 0,
+    detected_headers: document.detected_headers,
+    fingerprint: document.fingerprint,
+    matched_schema_id: document.matched_schema_id,
+  };
+}
+
+function buildApprovalResultFromDocument(document) {
+  if (
+    !document.matched_schema_id ||
+    (document.status !== "approved" && document.status !== "extracted")
+  ) {
+    return null;
+  }
+
+  return {
+    id: document.id,
+    status: document.status,
+    schema_id: document.matched_schema_id,
+    matched_schema_id: document.matched_schema_id,
+    fingerprint: document.fingerprint,
+  };
+}
+
+function buildExtractionResultFromDocument(document) {
+  if (!document.output_json) {
+    return null;
+  }
+
+  return {
+    id: document.id,
+    status: document.status,
+    schema_id: document.matched_schema_id,
+    output_json: document.output_json,
+  };
+}
+
+function shouldRestoreReviewScreen(document, detectionResult) {
+  return (
+    document.status === "needs_review" &&
+    detectionResult?.source !== "schema" &&
+    Boolean(detectionResult?.detected_headers?.header_structure)
+  );
+}
+
+function getDocumentIdFromUrl() {
+  const match = window.location.pathname.match(DOCUMENT_REVIEW_PATH_PATTERN);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function setDocumentReviewUrl(documentId) {
+  if (!documentId) {
+    return;
+  }
+
+  const nextPath = `/documents/${encodeURIComponent(documentId)}/review`;
+  if (window.location.pathname !== nextPath) {
+    window.history.pushState(null, "", nextPath);
+  }
+}
+
+function clearDocumentReviewUrl() {
+  if (getDocumentIdFromUrl()) {
+    window.history.pushState(null, "", "/");
+  }
 }
 
 function buildSectionsFromDetection(detectedHeaders) {
