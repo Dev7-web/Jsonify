@@ -9,6 +9,7 @@ from app.db import get_db
 from app.llm.header_prompt import HeaderStructure, HeaderStructureParseError
 from app.llm.header_prompt import validate_header_structure
 from app.models import Document, DocumentSchema
+from app.pipeline.fingerprint import build_deterministic_layout_fingerprint
 from app.pipeline.fingerprint import build_header_structure_fingerprint
 
 
@@ -18,6 +19,7 @@ class DocumentApprovalResponse(TypedDict):
     schema_id: str
     matched_schema_id: str
     fingerprint: str
+    deterministic_fingerprint: str | None
 
 
 class ApproveHeadersError(RuntimeError):
@@ -57,6 +59,7 @@ async def approve_document_headers(
         document = Document.model_validate(record)
         approved_header_structure = validate_header_structure(header_structure)
         fingerprint = build_header_structure_fingerprint(approved_header_structure)
+        deterministic_fingerprint = _get_document_deterministic_fingerprint(document)
     except HeaderStructureParseError as error:
         raise InvalidApprovedHeadersError(str(error)) from error
     except ValueError as error:
@@ -67,6 +70,7 @@ async def approve_document_headers(
         document=document,
         name=schema_name,
         fingerprint=fingerprint,
+        deterministic_fingerprint=deterministic_fingerprint,
         header_structure=approved_header_structure,
     )
 
@@ -76,6 +80,7 @@ async def approve_document_headers(
             "$set": {
                 "status": "approved",
                 "fingerprint": fingerprint,
+                "deterministic_fingerprint": deterministic_fingerprint,
                 "matched_schema_id": schema_id,
             },
             "$unset": {"failure_reason": ""},
@@ -88,6 +93,7 @@ async def approve_document_headers(
         "schema_id": schema_id,
         "matched_schema_id": schema_id,
         "fingerprint": fingerprint,
+        "deterministic_fingerprint": deterministic_fingerprint,
     }
 
 
@@ -97,12 +103,14 @@ async def _save_schema(
     document: Document,
     name: str,
     fingerprint: str,
+    deterministic_fingerprint: str | None,
     header_structure: HeaderStructure,
 ) -> str:
     schema = DocumentSchema(
         name=name,
         file_type=document.file_type,
         fingerprint=fingerprint,
+        deterministic_fingerprint=deterministic_fingerprint,
         version=1,
         status="active",
         header_structure=header_structure,
@@ -119,6 +127,7 @@ async def _save_schema(
             name=name,
             file_type=document.file_type,
             fingerprint=fingerprint,
+            deterministic_fingerprint=deterministic_fingerprint,
             header_structure=header_structure,
         )
     except Exception as error:
@@ -131,6 +140,7 @@ async def _update_existing_schema(
     name: str,
     file_type: str,
     fingerprint: str,
+    deterministic_fingerprint: str | None,
     header_structure: HeaderStructure,
 ) -> str:
     try:
@@ -145,6 +155,7 @@ async def _update_existing_schema(
                 "$set": {
                     "name": name,
                     "file_type": file_type,
+                    "deterministic_fingerprint": deterministic_fingerprint,
                     "status": "active",
                     "header_structure": header_structure,
                     "field_locators": {},
@@ -156,3 +167,30 @@ async def _update_existing_schema(
         raise
     except Exception as error:
         raise SchemaPersistenceError("Could not update existing approved schema.") from error
+
+
+def _get_document_deterministic_fingerprint(document: Document) -> str | None:
+    if document.deterministic_fingerprint:
+        return document.deterministic_fingerprint
+
+    detected_headers = document.detected_headers or {}
+    stored_fingerprint = detected_headers.get("deterministic_fingerprint")
+    if isinstance(stored_fingerprint, str) and stored_fingerprint:
+        return stored_fingerprint
+
+    deterministic_headers = detected_headers.get("deterministic_headers")
+    deterministic_key_value_sections = detected_headers.get(
+        "deterministic_key_value_sections",
+    )
+    if not isinstance(deterministic_headers, dict):
+        return None
+
+    try:
+        return build_deterministic_layout_fingerprint(
+            deterministic_headers,
+            deterministic_key_value_sections
+            if isinstance(deterministic_key_value_sections, dict)
+            else {},
+        ).fingerprint
+    except ValueError:
+        return None

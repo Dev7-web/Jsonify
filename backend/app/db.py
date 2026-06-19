@@ -36,6 +36,14 @@ async def ensure_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
         name="schemas_fingerprint_version_idx",
         unique=True,
     )
+    await database.schemas.create_index(
+        [
+            ("deterministic_fingerprint", ASCENDING),
+            ("file_type", ASCENDING),
+            ("status", ASCENDING),
+        ],
+        name="schemas_deterministic_fingerprint_idx",
+    )
 
 
 async def connect_to_mongo() -> None:

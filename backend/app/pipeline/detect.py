@@ -14,9 +14,11 @@ from app.parsing.excel_loader import load_sheets
 from app.parsing.flatten import flatten_excel
 from app.parsing.form_detector import DetectedKeyValueSection, detect_key_value_sections
 from app.parsing.header_detector import DetectedHeader, detect_table_headers
-from app.pipeline.fingerprint import SchemaMatch
+from app.pipeline.fingerprint import HeaderFingerprint, SchemaMatch
 from app.pipeline.fingerprint import build_deterministic_header_fingerprint
+from app.pipeline.fingerprint import build_deterministic_layout_fingerprint
 from app.pipeline.fingerprint import build_header_label_fingerprint
+from app.pipeline.fingerprint import match_schema_by_deterministic_fingerprint
 from app.pipeline.fingerprint import match_schema_by_fingerprint
 
 
@@ -43,6 +45,7 @@ class DetectionResult(TypedDict, total=False):
     header_structure: HeaderStructure
     deterministic_headers: dict[str, list[DetectedHeader]]
     deterministic_key_value_sections: dict[str, list[DetectedKeyValueSection]]
+    deterministic_fingerprint: str
     flags: list[DetectionFlag]
     confidence: float
     match: dict[str, Any]
@@ -55,6 +58,7 @@ class DocumentDetectionResponse(TypedDict, total=False):
     confidence: float
     detected_headers: DetectionResult
     fingerprint: str
+    deterministic_fingerprint: str
     matched_schema_id: str
 
 
@@ -128,11 +132,17 @@ async def detect_document_headers(
         deterministic_key_value_sections = _detect_deterministic_key_value_sections(
             workbook_path,
         )
+        deterministic_fingerprint = _build_deterministic_layout_match_fingerprint(
+            deterministic_headers,
+            deterministic_key_value_sections,
+        )
 
         schema_response = await _detect_known_schema(
             database,
             document=document,
             deterministic_headers=deterministic_headers,
+            deterministic_key_value_sections=deterministic_key_value_sections,
+            deterministic_fingerprint=deterministic_fingerprint,
         )
         if schema_response is not None:
             return schema_response
@@ -166,6 +176,10 @@ async def detect_document_headers(
             "flags": flags,
             "confidence": confidence,
         }
+        if deterministic_fingerprint is not None:
+            detection_result[
+                "deterministic_fingerprint"
+            ] = deterministic_fingerprint.fingerprint
 
         update_fields: dict[str, Any] = {
             "status": "needs_review",
@@ -177,6 +191,12 @@ async def detect_document_headers(
             update_fields["fingerprint"] = candidate_fingerprint.fingerprint
         else:
             unset_fields["fingerprint"] = ""
+        if deterministic_fingerprint is not None:
+            update_fields["deterministic_fingerprint"] = (
+                deterministic_fingerprint.fingerprint
+            )
+        else:
+            unset_fields["deterministic_fingerprint"] = ""
 
         unset_fields["matched_schema_id"] = ""
 
@@ -208,47 +228,69 @@ async def _detect_known_schema(
     *,
     document: Document,
     deterministic_headers: dict[str, list[DetectedHeader]],
+    deterministic_key_value_sections: dict[str, list[DetectedKeyValueSection]],
+    deterministic_fingerprint: HeaderFingerprint | None,
 ) -> DocumentDetectionResponse | None:
-    try:
-        candidate_fingerprint = build_deterministic_header_fingerprint(
-            deterministic_headers,
-        )
-    except ValueError:
-        return None
+    schema_match: SchemaMatch | None = None
+    candidate_fingerprint = deterministic_fingerprint
 
-    schema_match = await match_schema_by_fingerprint(
-        candidate_fingerprint,
-        db=db,
-        file_type=document.file_type,
-    )
+    if deterministic_fingerprint is not None:
+        schema_match = await match_schema_by_deterministic_fingerprint(
+            deterministic_fingerprint,
+            db=db,
+            file_type=document.file_type,
+        )
+
     if schema_match is None:
-        return None
+        try:
+            candidate_fingerprint = build_deterministic_header_fingerprint(
+                deterministic_headers,
+            )
+        except ValueError:
+            return None
+
+        schema_match = await match_schema_by_fingerprint(
+            candidate_fingerprint,
+            db=db,
+            file_type=document.file_type,
+        )
+        if schema_match is None:
+            return None
 
     confidence = schema_match.similarity.score
     detection_result: DetectionResult = {
         "source": "schema",
         "header_structure": schema_match.schema.header_structure,
         "deterministic_headers": deterministic_headers,
+        "deterministic_key_value_sections": deterministic_key_value_sections,
         "flags": [],
         "confidence": confidence,
         "match": _format_schema_match(schema_match, candidate_fingerprint.fingerprint),
     }
+    if deterministic_fingerprint is not None:
+        detection_result[
+            "deterministic_fingerprint"
+        ] = deterministic_fingerprint.fingerprint
+
+    update_fields: dict[str, Any] = {
+        "status": "approved",
+        "detected_headers": detection_result,
+        "confidence": confidence,
+        "fingerprint": schema_match.schema.fingerprint,
+        "matched_schema_id": schema_match.schema.id,
+    }
+    if deterministic_fingerprint is not None:
+        update_fields["deterministic_fingerprint"] = deterministic_fingerprint.fingerprint
 
     await db.documents.update_one(
         {"_id": document.id},
         {
-            "$set": {
-                "status": "approved",
-                "detected_headers": detection_result,
-                "confidence": confidence,
-                "fingerprint": schema_match.schema.fingerprint,
-                "matched_schema_id": schema_match.schema.id,
-            },
+            "$set": update_fields,
             "$unset": {"failure_reason": ""},
         },
     )
 
-    return {
+    response: DocumentDetectionResponse = {
         "id": document.id,
         "status": "approved",
         "source": "schema",
@@ -257,6 +299,10 @@ async def _detect_known_schema(
         "fingerprint": schema_match.schema.fingerprint,
         "matched_schema_id": schema_match.schema.id,
     }
+    if deterministic_fingerprint is not None:
+        response["deterministic_fingerprint"] = deterministic_fingerprint.fingerprint
+
+    return response
 
 
 def _format_schema_match(
@@ -268,6 +314,9 @@ def _format_schema_match(
         "schema_id": schema_match.schema.id,
         "schema_name": schema_match.schema.name,
         "schema_fingerprint": schema_match.schema.fingerprint,
+        "schema_deterministic_fingerprint": (
+            schema_match.schema.deterministic_fingerprint
+        ),
         "candidate_fingerprint": candidate_fingerprint,
         "score": similarity.score,
         "jaccard": similarity.jaccard,
@@ -455,6 +504,19 @@ def _detect_deterministic_key_value_sections(
         raise StoredDocumentFileError(str(error)) from error
     except ValueError as error:
         raise InvalidDocumentFileError(str(error)) from error
+
+
+def _build_deterministic_layout_match_fingerprint(
+    deterministic_headers: dict[str, list[DetectedHeader]],
+    deterministic_key_value_sections: dict[str, list[DetectedKeyValueSection]],
+) -> HeaderFingerprint | None:
+    try:
+        return build_deterministic_layout_fingerprint(
+            deterministic_headers,
+            deterministic_key_value_sections,
+        )
+    except ValueError:
+        return None
 
 
 def _deduplicate_headers(headers: list[DetectedHeader]) -> list[DetectedHeader]:

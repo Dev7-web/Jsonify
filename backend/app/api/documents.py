@@ -73,6 +73,7 @@ class DocumentResponse(BaseModel):
     output_json: dict[str, Any] | None = None
     confidence: float | None = None
     fingerprint: str | None = None
+    deterministic_fingerprint: str | None = None
     matched_schema_id: str | None = None
     failure_reason: str | None = None
 
@@ -84,6 +85,7 @@ class DocumentDetectHeadersResponse(BaseModel):
     confidence: float
     detected_headers: dict[str, Any]
     fingerprint: str | None = None
+    deterministic_fingerprint: str | None = None
     matched_schema_id: str | None = None
 
 
@@ -98,6 +100,7 @@ class DocumentApproveHeadersResponse(BaseModel):
     schema_id: str
     matched_schema_id: str
     fingerprint: str
+    deterministic_fingerprint: str | None = None
 
 
 class DocumentExtractResponse(BaseModel):
@@ -226,6 +229,7 @@ async def get_document(document_id: str) -> DocumentResponse:
         output_json=document.output_json,
         confidence=document.confidence,
         fingerprint=document.fingerprint,
+        deterministic_fingerprint=document.deterministic_fingerprint,
         matched_schema_id=document.matched_schema_id,
         failure_reason=document.failure_reason,
     )

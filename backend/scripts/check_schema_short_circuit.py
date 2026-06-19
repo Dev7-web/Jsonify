@@ -9,7 +9,11 @@ from openpyxl import Workbook
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from app.models import Document, DocumentSchema
+from app.parsing.excel_loader import load_sheets
+from app.parsing.form_detector import detect_key_value_sections
+from app.parsing.header_detector import detect_table_headers
 from app.pipeline import detect as detect_pipeline
+from app.pipeline.fingerprint import build_deterministic_layout_fingerprint
 from app.pipeline.fingerprint import build_header_structure_fingerprint
 
 
@@ -162,6 +166,19 @@ def create_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def create_deterministic_fingerprint(path: Path) -> str:
+    deterministic_headers = {
+        sheet_name: detect_pipeline._deduplicate_headers(detect_table_headers(grid))
+        for sheet_name, grid in load_sheets(path).items()
+    }
+    deterministic_key_value_sections = detect_key_value_sections(path)
+
+    return build_deterministic_layout_fingerprint(
+        deterministic_headers,
+        deterministic_key_value_sections,
+    ).fingerprint
+
+
 async def fail_if_llm_is_called(_: str):
     raise AssertionError("LLM should not be called when schema fingerprint matches.")
 
@@ -169,6 +186,7 @@ async def fail_if_llm_is_called(_: str):
 async def check_schema_match_skips_llm() -> None:
     workbook_path = UPLOADS_DIR / WORKBOOK_NAME
     create_workbook(workbook_path)
+    deterministic_fingerprint = create_deterministic_fingerprint(workbook_path)
 
     document = Document(
         filename=WORKBOOK_NAME,
@@ -179,6 +197,7 @@ async def check_schema_match_skips_llm() -> None:
         name="Dollar Tree approved layout",
         file_type="xlsx",
         fingerprint=build_header_structure_fingerprint(APPROVED_HEADER_STRUCTURE),
+        deterministic_fingerprint=deterministic_fingerprint,
         version=1,
         status="active",
         header_structure=APPROVED_HEADER_STRUCTURE,

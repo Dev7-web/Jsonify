@@ -26,6 +26,7 @@ from app.config import BACKEND_ROOT
 from app.db import get_db
 from app.models import Document, DocumentSchema
 from app.parsing.excel_loader import load_sheets
+from app.parsing.form_detector import detect_key_value_sections
 from app.parsing.header_detector import detect_table_headers
 from app.pipeline.detect import _deduplicate_headers
 from app.pipeline.fingerprint import (
@@ -34,6 +35,7 @@ from app.pipeline.fingerprint import (
     DEFAULT_MIN_SCHEMA_COVERAGE,
     DEFAULT_SCHEMA_MATCH_THRESHOLD,
     build_deterministic_header_fingerprint,
+    build_deterministic_layout_fingerprint,
     build_header_label_fingerprint,
     calculate_fingerprint_similarity,
 )
@@ -68,6 +70,7 @@ def compute_deterministic_fingerprint(document: Document):
         sheet_name: _deduplicate_headers(detect_table_headers(grid))
         for sheet_name, grid in sheets.items()
     }
+    deterministic_key_value_sections = detect_key_value_sections(workbook_path)
 
     label_summary = {
         sheet_name: [
@@ -80,7 +83,14 @@ def compute_deterministic_fingerprint(document: Document):
         for sheet_name, tables in deterministic.items()
     }
 
-    return build_deterministic_header_fingerprint(deterministic), label_summary
+    return (
+        build_deterministic_layout_fingerprint(
+            deterministic,
+            deterministic_key_value_sections,
+        ),
+        build_deterministic_header_fingerprint(deterministic),
+        label_summary,
+    )
 
 
 def assess_match(candidate, schema, schema_fp):
@@ -146,12 +156,24 @@ async def main() -> None:
     print()
 
     try:
-        candidate_fp, label_summary = compute_deterministic_fingerprint(document)
+        candidate_fp, legacy_candidate_fp, label_summary = compute_deterministic_fingerprint(
+            document,
+        )
     except (RuntimeError, ValueError) as error:
         print(f"Could not build deterministic fingerprint: {error}")
         return
 
-    print(f"--- Deterministic fingerprint ({len(candidate_fp.labels)} labels) ---")
+    print(
+        f"--- Deterministic layout fingerprint ({len(candidate_fp.labels)} labels) ---"
+    )
+    print(f"  {candidate_fp.fingerprint}")
+    print()
+    print(
+        f"--- Legacy table pre-scan fingerprint ({len(legacy_candidate_fp.labels)} labels) ---"
+    )
+    print(f"  {legacy_candidate_fp.fingerprint}")
+    print()
+    print("--- Deterministic table pre-scan summary ---")
     for sheet_name, tables in label_summary.items():
         print(f"  Sheet: {sheet_name}")
         for table in tables:
@@ -191,10 +213,18 @@ async def main() -> None:
             continue
 
         similarity, checks, would_match = assess_match(candidate_fp, schema, schema_fp)
-        verdict = "WOULD MATCH" if would_match else "no match"
-        marker = "[YES]" if would_match else "[ no]"
+        exact_deterministic_match = schema.deterministic_fingerprint == candidate_fp.fingerprint
+        verdict = (
+            "EXACT DETERMINISTIC MATCH"
+            if exact_deterministic_match
+            else "WOULD MATCH"
+            if would_match
+            else "no match"
+        )
+        marker = "[YES]" if exact_deterministic_match or would_match else "[ no]"
 
         print(f"  {marker} {schema.id} — {schema.name!r} ({verdict})")
+        print(f"    schema deterministic fp={schema.deterministic_fingerprint}")
         print(
             f"    score={similarity.score} "
             f"jaccard={similarity.jaccard} "

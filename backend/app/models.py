@@ -34,6 +34,7 @@ class Document(BaseModel):
     stored_path: str
     status: DocumentStatus = "uploaded"
     fingerprint: str | None = None
+    deterministic_fingerprint: str | None = None
     matched_schema_id: str | None = None
     detected_headers: dict[str, Any] | None = None
     output_json: dict[str, Any] | None = None
@@ -49,6 +50,7 @@ class DocumentSchema(BaseModel):
     name: str
     file_type: FileType
     fingerprint: str
+    deterministic_fingerprint: str | None = None
     version: int = Field(default=1, ge=1)
     status: SchemaStatus = "active"
     header_structure: dict[str, Any]

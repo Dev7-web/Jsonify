@@ -14,6 +14,7 @@ from app.models import DocumentSchema
 
 
 FINGERPRINT_VERSION = "headers-v1"
+DETERMINISTIC_FINGERPRINT_VERSION = "deterministic-v1"
 DEFAULT_SCHEMA_MATCH_THRESHOLD = 0.70
 DEFAULT_MIN_JACCARD = 0.45
 DEFAULT_MIN_SCHEMA_COVERAGE = 0.55
@@ -79,6 +80,49 @@ def build_deterministic_header_fingerprint(
     return _build_fingerprint_from_labels(
         labels,
         empty_message="Deterministic headers must contain at least one table title or column.",
+    )
+
+
+def build_deterministic_layout_fingerprint(
+    deterministic_headers: dict[str, list[dict[str, Any]]],
+    deterministic_key_value_sections: dict[str, list[dict[str, Any]]] | None = None,
+) -> HeaderFingerprint:
+    labels: set[str] = set()
+    key_value_rows = _key_value_rows_by_sheet(deterministic_key_value_sections or {})
+
+    for sheet_name, sections in (deterministic_key_value_sections or {}).items():
+        for section in sections:
+            _add_stable_layout_label(labels, section.get("title"))
+
+            for field in section.get("fields", []):
+                if isinstance(field, dict):
+                    _add_stable_layout_label(labels, field.get("name"))
+
+    for sheet_name, tables in deterministic_headers.items():
+        ignored_rows = key_value_rows.get(sheet_name, set())
+
+        for table in tables:
+            row_index = table.get("row_index")
+            if isinstance(row_index, int) and row_index in ignored_rows:
+                continue
+
+            column_names = _stable_unique_labels(
+                column.get("name")
+                for column in table.get("columns", [])
+                if isinstance(column, dict)
+            )
+            if len(column_names) < 2:
+                continue
+
+            _add_stable_layout_label(labels, table.get("title"))
+            labels.update(column_names)
+
+    return _build_fingerprint_from_labels(
+        labels,
+        empty_message=(
+            "Deterministic layout must contain at least one stable field or header."
+        ),
+        version=DETERMINISTIC_FINGERPRINT_VERSION,
     )
 
 
@@ -214,6 +258,42 @@ async def match_schema_by_fingerprint(
     )
 
 
+async def match_schema_by_deterministic_fingerprint(
+    candidate: HeaderFingerprint,
+    *,
+    db: AsyncIOMotorDatabase | None = None,
+    file_type: str | None = None,
+) -> SchemaMatch | None:
+    database = db if db is not None else get_db()
+
+    query: dict[str, Any] = {
+        "status": "active",
+        "deterministic_fingerprint": candidate.fingerprint,
+    }
+    if file_type is not None:
+        query["file_type"] = file_type
+
+    async for record in database.schemas.find(query):
+        try:
+            schema = DocumentSchema.model_validate(record)
+        except ValidationError:
+            continue
+
+        return SchemaMatch(
+            schema=schema,
+            similarity=FingerprintSimilarity(
+                score=1.0,
+                jaccard=1.0,
+                containment=1.0,
+                candidate_coverage=1.0,
+                schema_coverage=1.0,
+                overlap_count=len(candidate.labels),
+            ),
+        )
+
+    return None
+
+
 def _is_better_match(
     similarity: FingerprintSimilarity,
     current_match: SchemaMatch | None,
@@ -249,6 +329,7 @@ def _build_fingerprint_from_labels(
     labels: Iterable[str],
     *,
     empty_message: str,
+    version: str = FINGERPRINT_VERSION,
 ) -> HeaderFingerprint:
     normalized_labels = frozenset(label for label in labels if label)
     if not normalized_labels:
@@ -257,7 +338,7 @@ def _build_fingerprint_from_labels(
     digest_source = "\n".join(sorted(normalized_labels)).encode("utf-8")
     digest = hashlib.sha256(digest_source).hexdigest()
     return HeaderFingerprint(
-        fingerprint=f"{FINGERPRINT_VERSION}:{digest}",
+        fingerprint=f"{version}:{digest}",
         labels=normalized_labels,
     )
 
@@ -276,6 +357,79 @@ def _add_label(labels: set[str], value: Any) -> None:
     label = _normalize_label(value)
     if label:
         labels.add(label)
+
+
+def _add_stable_layout_label(labels: set[str], value: Any) -> None:
+    if not isinstance(value, str):
+        return
+
+    label = _normalize_label(value)
+    if _is_stable_layout_label(label):
+        labels.add(label)
+
+
+def _stable_unique_labels(values: Iterable[Any]) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        if not isinstance(value, str):
+            continue
+
+        label = _normalize_label(value)
+        if label in seen or not _is_stable_layout_label(label):
+            continue
+
+        seen.add(label)
+        labels.append(label)
+
+    return labels
+
+
+def _key_value_rows_by_sheet(
+    key_value_sections: dict[str, list[dict[str, Any]]],
+) -> dict[str, set[int]]:
+    rows_by_sheet: dict[str, set[int]] = {}
+
+    for sheet_name, sections in key_value_sections.items():
+        rows: set[int] = set()
+
+        for section in sections:
+            row_index = section.get("row_index")
+            if isinstance(row_index, int):
+                rows.add(row_index)
+
+            for field in section.get("fields", []):
+                if not isinstance(field, dict):
+                    continue
+
+                coordinate = field.get("coordinate")
+                if isinstance(coordinate, str):
+                    row = _coordinate_row(coordinate)
+                    if row is not None:
+                        rows.add(row)
+
+        rows_by_sheet[sheet_name] = rows
+
+    return rows_by_sheet
+
+
+def _coordinate_row(coordinate: str) -> int | None:
+    match = re.search(r"\d+", coordinate)
+    if match is None:
+        return None
+
+    return int(match.group(0))
+
+
+def _is_stable_layout_label(label: str) -> bool:
+    if not label:
+        return False
+
+    if len(label) > 80:
+        return False
+
+    return any(character.isalpha() for character in label)
 
 
 def _normalize_label(value: str) -> str:
