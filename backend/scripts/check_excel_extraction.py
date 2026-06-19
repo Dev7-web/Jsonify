@@ -196,6 +196,23 @@ PACIFIC_HEADER_STRUCTURE = {
                         {"name": "Cite"},
                     ],
                 },
+                {
+                    "type": "table",
+                    "title": "Expense Recoveries - CAM:",
+                    "headers": [
+                        {"name": "Begin Date"},
+                        {"name": "End Date"},
+                        {"name": "Type"},
+                        {"name": "Pro-rata share"},
+                        {"name": "Base Year"},
+                        {"name": "Cap"},
+                    ],
+                },
+                {
+                    "type": "key_value",
+                    "title": "Lease_Abstract (1) section 9",
+                    "fields": ["Notes :"],
+                },
             ],
         }
     ]
@@ -323,6 +340,51 @@ def create_pacific_workbook(
             "3rd Amd., Pg 1",
         ]
     )
+    worksheet.append([])
+    worksheet.append(
+        [
+            None,
+            "Expense Recoveries - CAM:",
+            "Expense Recoveries - CAM:",
+            "Expense Recoveries - CAM:",
+            "Expense Recoveries - CAM:",
+            "Expense Recoveries - CAM:",
+            "Expense Recoveries - CAM:",
+        ]
+    )
+    worksheet.append(
+        [
+            None,
+            "Begin Date",
+            "End Date",
+            "Type",
+            "Pro-rata share",
+            "Base Year",
+            "Cap",
+        ]
+    )
+    worksheet.append(
+        [
+            None,
+            "01/04/2024",
+            "03/31/2027",
+            "Net",
+            "{{Pro Rata Share Financial_subsummarization}}",
+            "{{Base Year_subsummarization}}",
+            "{{CAP_subsummarization}}",
+        ]
+    )
+    worksheet.append(
+        [
+            None,
+            "Notes :",
+            "Add.,Art.51&56: TT shall pay operating expenses as additional rent.",
+            "Add.,Art.51&56: TT shall pay operating expenses as additional rent.",
+            "Add.,Art.51&56: TT shall pay operating expenses as additional rent.",
+            "Add.,Art.51&56: TT shall pay operating expenses as additional rent.",
+            "Add.,Art.51&56: TT shall pay operating expenses as additional rent.",
+        ]
+    )
 
     workbook.save(path)
 
@@ -365,7 +427,7 @@ async def main() -> None:
     assert "field_locators" in fake_db.schemas.records[schema.id]
     assert fake_db.documents.records[document.id]["status"] == "extracted"
     assert fake_db.documents.records[document.id]["output_json"] == output_json
-    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 1
+    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 2
     assert (
         fake_db.documents.records[document.id]["extraction_locators"]["schema_id"]
         == schema.id
@@ -479,6 +541,22 @@ async def main() -> None:
             "Cite": "3rd Amd., Pg 1",
         }
     ]
+    assert matched_sheet["Expense Recoveries - CAM:"] == {
+        "rows": [
+            {
+                "Begin Date": "01/04/2024",
+                "End Date": "03/31/2027",
+                "Type": "Net",
+                "Pro-rata share": "{{Pro Rata Share Financial_subsummarization}}",
+                "Base Year": "{{Base Year_subsummarization}}",
+                "Cap": "{{CAP_subsummarization}}",
+            }
+        ],
+        "Notes :": (
+            "Add.,Art.51&56: TT shall pay operating expenses as additional rent."
+        ),
+    }
+    assert "Lease_Abstract (1) section 9" not in matched_sheet
     assert source_result["locators_created"] is True
     assert matched_result["locators_created"] is True
     assert (

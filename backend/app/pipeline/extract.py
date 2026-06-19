@@ -20,7 +20,11 @@ ExtractedJson = dict[str, Any]
 
 _RESOLVED_BACKEND_ROOT = BACKEND_ROOT.resolve()
 _WHITESPACE_PATTERN = re.compile(r"\s+")
-_LOCATOR_VERSION = 1
+_SYNTHETIC_SECTION_TITLE_PATTERN = re.compile(
+    r".+\s+section\s+\d+\s*$",
+    re.IGNORECASE,
+)
+_LOCATOR_VERSION = 2
 _LOCATOR_TYPE = "excel"
 _MAX_SECTION_SEARCH_ROWS = 80
 
@@ -176,12 +180,13 @@ def build_excel_field_locators(
     for sheet in header_structure.get("sheets", []):
         requested_sheet_name = _require_string(sheet.get("name"), "sheet.name")
         sheet_name, grid = _find_sheet_grid(sheets, requested_sheet_name)
-        sections = sheet.get("sections", [])
-        if not isinstance(sections, list):
+        raw_sections = sheet.get("sections", [])
+        if not isinstance(raw_sections, list):
             raise ExtractLocatorError(
                 f'Sheet "{requested_sheet_name}" sections must be a list.'
             )
 
+        sections = _workbook_supported_sections(grid, raw_sections)
         section_title_rows = _collect_section_title_rows(grid, sections)
         located_sections: list[dict[str, Any]] = []
 
@@ -353,6 +358,48 @@ def _locate_key_value_section(
         "search_end_row": end_row,
         "fields": field_locators,
     }
+
+
+def _workbook_supported_sections(
+    grid: Grid,
+    sections: list[Any],
+) -> list[Any]:
+    return [
+        section
+        for section in sections
+        if not (
+            isinstance(section, dict)
+            and _is_unanchored_synthetic_metadata_section(grid, section)
+        )
+    ]
+
+
+def _is_unanchored_synthetic_metadata_section(
+    grid: Grid,
+    section: dict[str, Any],
+) -> bool:
+    if section.get("type") != "key_value":
+        return False
+
+    title = _optional_string(section.get("title"))
+    if title is None or not _looks_like_synthetic_section_title(title):
+        return False
+
+    fields = section.get("fields")
+    if not isinstance(fields, list) or not fields:
+        return False
+
+    if not all(
+        isinstance(field, str) and _is_table_metadata_label(field)
+        for field in fields
+    ):
+        return False
+
+    return _find_section_title_cell(grid, title, start_row=1, end_row=len(grid)) is None
+
+
+def _looks_like_synthetic_section_title(title: str) -> bool:
+    return _SYNTHETIC_SECTION_TITLE_PATTERN.fullmatch(title.strip()) is not None
 
 
 def _locate_table_section(
@@ -570,7 +617,7 @@ def _extract_key_value_section(
 def _extract_table_section(
     grid: Grid,
     section_locator: dict[str, Any],
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | dict[str, Any]:
     header_row_index = _require_int(
         section_locator.get("header_row_index"),
         "table locator header_row_index",
@@ -580,6 +627,7 @@ def _extract_table_section(
         raise ExtractLocatorError("Table locator must contain at least one column.")
 
     rows: list[dict[str, Any]] = []
+    metadata: dict[str, Any] = {}
     row_index = header_row_index + 1
     data_end_row_index = section_locator.get("data_end_row_index")
     if not isinstance(data_end_row_index, int):
@@ -599,6 +647,13 @@ def _extract_table_section(
             row_index += 1
             continue
 
+        metadata_row = _table_metadata_row(row, columns)
+        if metadata_row is not None:
+            metadata_key = _unique_key(metadata, metadata_row["name"])
+            metadata[metadata_key] = _json_safe_value(metadata_row["value"])
+            row_index += 1
+            continue
+
         row_object: dict[str, Any] = {}
         for column in columns:
             name = _require_string(column.get("name"), "table column name")
@@ -610,7 +665,14 @@ def _extract_table_section(
 
         row_index += 1
 
-    return rows
+    if not metadata:
+        return rows
+
+    table_output: dict[str, Any] = {"rows": rows}
+    for key, value in metadata.items():
+        table_output[_unique_key(table_output, key)] = value
+
+    return table_output
 
 
 def _find_label_cell(
@@ -730,6 +792,61 @@ def _looks_like_repeated_header(
             matched += 1
 
     return matched == len(columns)
+
+
+def _table_metadata_row(
+    row: list[Any | None],
+    columns: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    ordered_columns = sorted(
+        columns,
+        key=lambda column: _require_int(
+            column.get("column_index"),
+            "table column index",
+        ),
+    )
+    if not ordered_columns:
+        return None
+
+    first_column_index = _require_int(
+        ordered_columns[0].get("column_index"),
+        "table column index",
+    )
+    label = _cell_at_row(row, first_column_index)
+    if not _is_table_metadata_label(label):
+        return None
+
+    label_text = _require_string(label, "table metadata label")
+    normalized_label = _normalize_label(label_text)
+    value: Any | None = None
+    normalized_values: set[str] = set()
+
+    for column in ordered_columns[1:]:
+        column_index = _require_int(column.get("column_index"), "table column index")
+        candidate = _cell_at_row(row, column_index)
+        if _is_empty(candidate):
+            continue
+
+        normalized_candidate = _normalize_label(candidate)
+        if normalized_candidate == normalized_label:
+            continue
+
+        if value is None:
+            value = candidate
+
+        normalized_values.add(normalized_candidate or str(candidate).strip().casefold())
+        if len(normalized_values) > 1:
+            return None
+
+    return {"name": label_text, "value": value}
+
+
+def _is_table_metadata_label(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    label = _WHITESPACE_PATTERN.sub(" ", value).strip()
+    return label.endswith(":")
 
 
 def _is_blank_for_columns(

@@ -378,6 +378,7 @@ export default function App() {
   function addSection() {
     const nextSection = {
       id: `section-${Date.now()}`,
+      sheetName: selectedSection?.sheetName ?? sections[0]?.sheetName ?? "Workbook",
       title: "New Section",
       type: "table",
       headers: [],
@@ -798,6 +799,9 @@ function HeaderReviewScreen({
             <div>
               <p className="eyebrow">Selected section</p>
               <h2>{selectedSection?.title ?? "No section selected"}</h2>
+              {selectedSection?.sheetName ? (
+                <p className="selected-sheet-label">{selectedSection.sheetName}</p>
+              ) : null}
             </div>
             <div className="toolbar">
               <button className="button-secondary-small" onClick={onAddSection} type="button">

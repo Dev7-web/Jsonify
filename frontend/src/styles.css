@@ -372,12 +372,62 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
+.selected-sheet-label {
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 800;
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+}
+
 .section-stack,
 .headers-list,
 .editor-panel,
 .schema-panel {
   display: grid;
   gap: 10px;
+}
+
+.sheet-section-group {
+  display: grid;
+  gap: 8px;
+}
+
+.sheet-section-heading {
+  align-items: center;
+  background: #f1f5f9;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  color: #475569;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+.sheet-section-heading span {
+  color: #0f172a;
+  flex: 1 1 auto;
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1.25;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sheet-section-heading small {
+  color: #64748b;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.sheet-section-stack {
+  display: grid;
+  gap: 10px;
+  padding-left: 10px;
 }
 
 .section-card,
