@@ -37,6 +37,7 @@ class Document(BaseModel):
     deterministic_fingerprint: str | None = None
     matched_schema_id: str | None = None
     detected_headers: dict[str, Any] | None = None
+    extraction_locators: dict[str, Any] | None = None
     output_json: dict[str, Any] | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     failure_reason: str | None = None

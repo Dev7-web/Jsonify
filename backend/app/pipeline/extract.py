@@ -107,20 +107,21 @@ async def extract_document_json(
     sheets = _load_workbook_sheets(workbook_path)
 
     locators_created = False
-    field_locators = schema.field_locators
-    if not _is_supported_field_locators(field_locators):
-        field_locators = build_excel_field_locators(schema.header_structure, sheets)
-        locators_created = True
-        await database.schemas.update_one(
-            {"_id": schema.id},
-            {"$set": {"field_locators": field_locators}},
+    field_locators = document.extraction_locators
+    if not _is_supported_document_field_locators(field_locators, schema.id):
+        field_locators = build_excel_field_locators(
+            schema.header_structure,
+            sheets,
+            schema_id=schema.id,
         )
+        locators_created = True
 
     output_json = extract_excel_with_locators(sheets, field_locators)
     update_result = await database.documents.update_one(
         {"_id": document.id},
         {
             "$set": {
+                "extraction_locators": field_locators,
                 "output_json": output_json,
                 "status": "extracted",
             },
@@ -167,6 +168,8 @@ async def get_document_output_json(
 def build_excel_field_locators(
     header_structure: dict[str, Any],
     sheets: dict[str, Grid],
+    *,
+    schema_id: str | None = None,
 ) -> FieldLocators:
     sheet_locators: list[dict[str, Any]] = []
 
@@ -223,11 +226,15 @@ def build_excel_field_locators(
             }
         )
 
-    return {
+    locators: FieldLocators = {
         "version": _LOCATOR_VERSION,
         "type": _LOCATOR_TYPE,
         "sheets": sheet_locators,
     }
+    if schema_id is not None:
+        locators["schema_id"] = schema_id
+
+    return locators
 
 
 def extract_excel_with_locators(
@@ -290,9 +297,10 @@ def _locate_key_value_section(
             f'Key/value section "{section_name}" fields must be a list.'
         )
 
+    field_names = [_require_string(field, "key_value field") for field in fields]
+    section_field_labels = {_normalize_label(field_name) for field_name in field_names}
     field_locators = []
-    for field in fields:
-        field_name = _require_string(field, "key_value field")
+    for field_name in field_names:
         label_cell = _find_label_cell(
             grid,
             field_name,
@@ -315,6 +323,7 @@ def _locate_key_value_section(
             row_index=label_cell["row_index"],
             column_index=label_cell["column_index"],
             label=field_name,
+            stop_labels=section_field_labels - {_normalize_label(field_name)},
         )
         field_locators.append(
             {
@@ -338,6 +347,7 @@ def _locate_key_value_section(
     return {
         "type": "key_value",
         "title": title,
+        "output_title": _normalize_section_title_for_output(title),
         "section_index": section_index,
         "search_start_row": start_row,
         "search_end_row": end_row,
@@ -397,8 +407,10 @@ def _locate_table_section(
     return {
         "type": "table",
         "title": title,
+        "output_title": _normalize_section_title_for_output(title),
         "section_index": section_index,
         "header_row_index": header_row["row_index"],
+        "data_end_row_index": end_row,
         "columns": located_columns,
     }
 
@@ -416,7 +428,7 @@ def _collect_section_title_rows(
         if not title:
             continue
 
-        title_cell = _find_label_cell(grid, title, start_row=1, end_row=len(grid))
+        title_cell = _find_section_title_cell(grid, title, start_row=1, end_row=len(grid))
         if title_cell is not None:
             title_rows[index] = title_cell["row_index"]
 
@@ -430,7 +442,7 @@ def _section_search_bounds(
     row_count: int,
 ) -> tuple[int, int]:
     title_row = section_title_rows.get(section_index)
-    start_row = (title_row + 1) if title_row is not None else 1
+    start_row = title_row if title_row is not None else 1
 
     later_title_rows = [
         row_index
@@ -569,7 +581,12 @@ def _extract_table_section(
 
     rows: list[dict[str, Any]] = []
     row_index = header_row_index + 1
-    while row_index <= len(grid):
+    data_end_row_index = section_locator.get("data_end_row_index")
+    if not isinstance(data_end_row_index, int):
+        data_end_row_index = len(grid)
+
+    row_limit = min(data_end_row_index, len(grid))
+    while row_index <= row_limit:
         row = grid[row_index - 1]
 
         if _is_blank_for_columns(row, columns):
@@ -630,12 +647,51 @@ def _find_label_cell(
     return None
 
 
+def _find_section_title_cell(
+    grid: Grid,
+    title: str,
+    *,
+    start_row: int,
+    end_row: int,
+) -> dict[str, Any] | None:
+    exact_cell = _find_label_cell(grid, title, start_row=start_row, end_row=end_row)
+    if exact_cell is not None:
+        return exact_cell
+
+    prefix = _section_title_match_prefix(title)
+    if prefix is None:
+        return None
+
+    for row_index in range(start_row, min(end_row, len(grid)) + 1):
+        row = grid[row_index - 1]
+        previous_normalized_value: str | None = None
+        for column_offset, value in enumerate(row):
+            normalized = _normalize_label(value)
+            if not normalized:
+                continue
+
+            if normalized == previous_normalized_value:
+                continue
+
+            previous_normalized_value = normalized
+            if normalized == prefix or normalized.startswith(f"{prefix}:"):
+                column_index = column_offset + 1
+                return {
+                    "row_index": row_index,
+                    "column_index": column_index,
+                    "coordinate": _coordinate(row_index, column_index),
+                }
+
+    return None
+
+
 def _find_value_cell_to_right(
     grid: Grid,
     *,
     row_index: int,
     column_index: int,
     label: str,
+    stop_labels: set[str],
 ) -> dict[str, Any] | None:
     row = grid[row_index - 1]
     normalized_label = _normalize_label(label)
@@ -645,8 +701,12 @@ def _find_value_cell_to_right(
         if _is_empty(value):
             continue
 
-        if _normalize_label(value) == normalized_label:
+        normalized_value = _normalize_label(value)
+        if normalized_value == normalized_label:
             continue
+
+        if normalized_value in stop_labels:
+            return None
 
         value_column_index = column_offset + 1
         return {
@@ -700,9 +760,13 @@ def _find_sheet_grid(
 
 
 def _section_output_title(section_locator: dict[str, Any]) -> str:
+    output_title = _optional_string(section_locator.get("output_title"))
+    if output_title:
+        return output_title
+
     title = _optional_string(section_locator.get("title"))
     if title:
-        return title
+        return _normalize_section_title_for_output(title)
 
     section_index = section_locator.get("section_index")
     if isinstance(section_index, int):
@@ -729,6 +793,34 @@ def _is_supported_field_locators(field_locators: Any) -> bool:
         and field_locators.get("type") == _LOCATOR_TYPE
         and isinstance(field_locators.get("sheets"), list)
     )
+
+
+def _is_supported_document_field_locators(
+    field_locators: Any,
+    schema_id: str,
+) -> bool:
+    return (
+        _is_supported_field_locators(field_locators)
+        and field_locators.get("schema_id") == schema_id
+    )
+
+
+def _section_title_match_prefix(title: str) -> str | None:
+    normalized_title = _normalize_label(title)
+    if normalized_title.startswith("lease information:"):
+        return "lease information"
+
+    return None
+
+
+def _normalize_section_title_for_output(title: str | None) -> str | None:
+    if title is None:
+        return None
+
+    if _section_title_match_prefix(title) == "lease information":
+        return "Lease Information"
+
+    return title
 
 
 def _resolve_stored_path(stored_path: str) -> Path:
