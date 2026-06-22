@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from collections.abc import Callable
 from typing import Final
 
 from google import genai
@@ -12,12 +14,20 @@ from app.config import (
     get_llm_max_retries,
     get_llm_model,
     get_llm_retry_base_seconds,
+    get_pii_enabled,
     get_required_env,
 )
+from app.pii.adapt import (
+    cell_map_to_llm_text,
+    contains_placeholder,
+    normalize_placeholder_tokens,
+)
+from app.pii.client import PiiServiceError, pii_redact, pii_restore
 
 
 TRANSIENT_STATUS_CODES: Final[set[int]] = {408, 429, 500, 502, 503, 504}
 
+logger = logging.getLogger(__name__)
 _client: genai.Client | None = None
 
 
@@ -72,6 +82,76 @@ async def acall_llm(
         max_retries=get_llm_max_retries() if max_retries is None else max_retries,
         response_mime_type=response_mime_type,
     )
+
+
+async def gemini_call(
+    system: str,
+    user: str,
+    *,
+    model: str | None = None,
+    temperature: float = DEFAULT_LLM_TEMPERATURE,
+    max_retries: int | None = None,
+    response_mime_type: str | None = None,
+) -> str:
+    return await acall_llm(
+        system,
+        user,
+        model=model,
+        temperature=temperature,
+        max_retries=max_retries,
+        response_mime_type=response_mime_type,
+    )
+
+
+async def call_llm_with_pii(
+    system: str,
+    cell_map: dict[str, str],
+    *,
+    build_user_prompt: Callable[[str], str] | None = None,
+    pii_document_id_callback: Callable[[str], None] | None = None,
+    model: str | None = None,
+    temperature: float = DEFAULT_LLM_TEMPERATURE,
+    max_retries: int | None = None,
+    response_mime_type: str | None = None,
+) -> str:
+    prompt_builder = build_user_prompt or (lambda flattened_text: flattened_text)
+
+    if not get_pii_enabled():
+        return await gemini_call(
+            system,
+            prompt_builder(cell_map_to_llm_text(cell_map)),
+            model=model,
+            temperature=temperature,
+            max_retries=max_retries,
+            response_mime_type=response_mime_type,
+        )
+
+    document_id, redacted_map = await pii_redact(cell_map)
+    logger.info("PII redacted document_id=%s", document_id)
+    if pii_document_id_callback is not None:
+        pii_document_id_callback(document_id)
+
+    if not isinstance(redacted_map, dict):
+        raise PiiServiceError("PII redact response data must be a JSON object.")
+
+    raw = await gemini_call(
+        system,
+        prompt_builder(cell_map_to_llm_text(redacted_map)),
+        model=model,
+        temperature=temperature,
+        max_retries=max_retries,
+        response_mime_type=response_mime_type,
+    )
+
+    raw_for_restore = normalize_placeholder_tokens(raw)
+    if not contains_placeholder(raw_for_restore):
+        return raw
+
+    restored = await pii_restore(document_id, {"llm_output": raw_for_restore})
+    if not isinstance(restored, dict) or not isinstance(restored.get("llm_output"), str):
+        raise PiiServiceError("PII restore response missing llm_output.")
+
+    return restored["llm_output"]
 
 
 def _validate_prompts(system: str, user: str) -> None:

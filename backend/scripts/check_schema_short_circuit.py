@@ -179,7 +179,7 @@ def create_deterministic_fingerprint(path: Path) -> str:
     ).fingerprint
 
 
-async def fail_if_llm_is_called(_: str):
+async def fail_if_llm_is_called(*_: object, **__: object):
     raise AssertionError("LLM should not be called when schema fingerprint matches.")
 
 
@@ -204,13 +204,13 @@ async def check_schema_match_skips_llm() -> None:
     )
     fake_db = FakeDb(document, [schema])
 
-    original_llm = detect_pipeline.adetect_header_structure
-    detect_pipeline.adetect_header_structure = fail_if_llm_is_called
+    original_llm = detect_pipeline.adetect_header_structure_from_cell_map
+    detect_pipeline.adetect_header_structure_from_cell_map = fail_if_llm_is_called
 
     try:
         result = await detect_pipeline.detect_document_headers(document.id, db=fake_db)
     finally:
-        detect_pipeline.adetect_header_structure = original_llm
+        detect_pipeline.adetect_header_structure_from_cell_map = original_llm
         workbook_path.unlink(missing_ok=True)
 
     stored_document = fake_db.documents.records[document.id]
@@ -239,18 +239,18 @@ async def check_no_match_uses_llm() -> None:
     fake_db = FakeDb(document, [])
     llm_calls = 0
 
-    async def fake_llm(_: str):
+    async def fake_llm(*_: object, **__: object):
         nonlocal llm_calls
         llm_calls += 1
         return APPROVED_HEADER_STRUCTURE
 
-    original_llm = detect_pipeline.adetect_header_structure
-    detect_pipeline.adetect_header_structure = fake_llm
+    original_llm = detect_pipeline.adetect_header_structure_from_cell_map
+    detect_pipeline.adetect_header_structure_from_cell_map = fake_llm
 
     try:
         result = await detect_pipeline.detect_document_headers(document.id, db=fake_db)
     finally:
-        detect_pipeline.adetect_header_structure = original_llm
+        detect_pipeline.adetect_header_structure_from_cell_map = original_llm
         workbook_path.unlink(missing_ok=True)
 
     stored_document = fake_db.documents.records[document.id]

@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any, Literal, TypedDict, cast
 
-from app.llm.client import acall_llm, call_llm
+from app.llm.client import acall_llm, call_llm, call_llm_with_pii
 
 
 SectionType = Literal["key_value", "table"]
@@ -103,7 +103,11 @@ def build_header_detection_messages(flattened_text: str) -> tuple[str, str]:
     if not flattened_text.strip():
         raise ValueError("flattened_text must not be empty.")
 
-    return SYSTEM_PROMPT, USER_PROMPT_TEMPLATE.replace("{flattened_text}", flattened_text)
+    return SYSTEM_PROMPT, build_header_detection_user_prompt(flattened_text)
+
+
+def build_header_detection_user_prompt(flattened_text: str) -> str:
+    return USER_PROMPT_TEMPLATE.replace("{flattened_text}", flattened_text)
 
 
 # ponytail: full flattened workbook passed in one shot. Safe under the 25 MB
@@ -117,6 +121,21 @@ def detect_header_structure(flattened_text: str) -> HeaderStructure:
 async def adetect_header_structure(flattened_text: str) -> HeaderStructure:
     system, user = build_header_detection_messages(flattened_text)
     response = await acall_llm(system, user, response_mime_type="application/json")
+    return parse_header_structure(response)
+
+
+async def adetect_header_structure_from_cell_map(
+    cell_map: dict[str, str],
+    *,
+    pii_document_id_callback: Any | None = None,
+) -> HeaderStructure:
+    response = await call_llm_with_pii(
+        SYSTEM_PROMPT,
+        cell_map,
+        build_user_prompt=build_header_detection_user_prompt,
+        pii_document_id_callback=pii_document_id_callback,
+        response_mime_type="application/json",
+    )
     return parse_header_structure(response)
 
 

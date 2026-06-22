@@ -8,12 +8,12 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.config import BACKEND_ROOT
 from app.db import get_db
-from app.llm.header_prompt import HeaderStructure, adetect_header_structure
+from app.llm.header_prompt import HeaderStructure, adetect_header_structure_from_cell_map
 from app.models import Document
 from app.parsing.excel_loader import load_sheets
-from app.parsing.flatten import flatten_excel
 from app.parsing.form_detector import DetectedKeyValueSection, detect_key_value_sections
 from app.parsing.header_detector import DetectedHeader, detect_table_headers
+from app.pii.adapt import excel_path_to_cell_map
 from app.pipeline.fingerprint import HeaderFingerprint, SchemaMatch
 from app.pipeline.fingerprint import build_deterministic_header_fingerprint
 from app.pipeline.fingerprint import build_deterministic_layout_fingerprint
@@ -117,6 +117,7 @@ async def detect_document_headers(
                 "confidence": "",
                 "fingerprint": "",
                 "matched_schema_id": "",
+                "pii_document_id": "",
                 "failure_reason": "",
             },
         },
@@ -147,8 +148,12 @@ async def detect_document_headers(
         if schema_response is not None:
             return schema_response
 
-        flattened_text = _flatten_workbook(workbook_path)
-        header_structure = await adetect_header_structure(flattened_text)
+        pii_document_ids: list[str] = []
+        cell_map = _build_llm_cell_map(workbook_path)
+        header_structure = await adetect_header_structure_from_cell_map(
+            cell_map,
+            pii_document_id_callback=pii_document_ids.append,
+        )
         header_structure = apply_key_value_section_hints(
             header_structure,
             deterministic_key_value_sections,
@@ -186,6 +191,8 @@ async def detect_document_headers(
             "detected_headers": detection_result,
             "confidence": confidence,
         }
+        if pii_document_ids:
+            update_fields["pii_document_id"] = pii_document_ids[-1]
         unset_fields: dict[str, str] = {}
         if candidate_fingerprint is not None:
             update_fields["fingerprint"] = candidate_fingerprint.fingerprint
@@ -506,6 +513,15 @@ def _detect_deterministic_key_value_sections(
         raise InvalidDocumentFileError(str(error)) from error
 
 
+def _build_llm_cell_map(path: Path) -> dict[str, str]:
+    try:
+        return excel_path_to_cell_map(path)
+    except FileNotFoundError as error:
+        raise StoredDocumentFileError(str(error)) from error
+    except ValueError as error:
+        raise InvalidDocumentFileError(str(error)) from error
+
+
 def _build_deterministic_layout_match_fingerprint(
     deterministic_headers: dict[str, list[DetectedHeader]],
     deterministic_key_value_sections: dict[str, list[DetectedKeyValueSection]],
@@ -538,16 +554,6 @@ def _deduplicate_headers(headers: list[DetectedHeader]) -> list[DetectedHeader]:
         deduplicated.append(header)
 
     return deduplicated
-
-
-def _flatten_workbook(path: Path) -> str:
-    try:
-        return flatten_excel(path)
-    except FileNotFoundError as error:
-        raise StoredDocumentFileError(str(error)) from error
-    except ValueError as error:
-        raise InvalidDocumentFileError(str(error)) from error
-
 
 def apply_key_value_section_hints(
     header_structure: HeaderStructure,
