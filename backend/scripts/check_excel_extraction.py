@@ -40,6 +40,11 @@ HEADER_STRUCTURE = {
                         {"name": "Annual Amt"},
                     ],
                 },
+                {
+                    "type": "key_value",
+                    "title": "REBO Comment",
+                    "fields": [],
+                },
             ],
         }
     ]
@@ -151,6 +156,10 @@ def create_workbook(path: Path) -> None:
             3000,
         ]
     )
+    worksheet["K1"] = "REBO Comment"
+    worksheet["K2"] = "Lease ID reviewed from source document"
+    worksheet["K7"] = "Rent row needs legal review"
+    worksheet["K8"] = "CAM row confirmed"
 
     workbook.save(path)
 
@@ -427,7 +436,7 @@ async def main() -> None:
     assert "field_locators" in fake_db.schemas.records[schema.id]
     assert fake_db.documents.records[document.id]["status"] == "extracted"
     assert fake_db.documents.records[document.id]["output_json"] == output_json
-    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 2
+    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 3
     assert (
         fake_db.documents.records[document.id]["extraction_locators"]["schema_id"]
         == schema.id
@@ -452,6 +461,11 @@ async def main() -> None:
             "Annual Amt": 3000,
         },
     ]
+    assert sheet_json["REBO Comment"] == {
+        "row_2": "Lease ID reviewed from source document",
+        "row_7": "Rent row needs legal review",
+        "row_8": "CAM row confirmed",
+    }
 
     pacific_schema = DocumentSchema(
         name="Pacific Clinics extraction layout",

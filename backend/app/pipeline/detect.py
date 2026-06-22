@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -8,12 +9,21 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.config import BACKEND_ROOT
 from app.db import get_db
-from app.llm.header_prompt import HeaderStructure, adetect_header_structure_from_cell_map
+from app.llm.header_prompt import (
+    HeaderStructure,
+    adetect_header_structure_from_cell_map,
+    validate_header_structure,
+)
 from app.models import Document
 from app.parsing.excel_loader import load_sheets
 from app.parsing.form_detector import DetectedKeyValueSection, detect_key_value_sections
 from app.parsing.header_detector import DetectedHeader, detect_table_headers
-from app.pii.adapt import excel_path_to_cell_map
+from app.pii.adapt import (
+    contains_placeholder,
+    excel_path_to_cell_map,
+    normalize_placeholder_tokens,
+)
+from app.pii.client import PiiServiceError, pii_restore
 from app.pipeline.fingerprint import HeaderFingerprint, SchemaMatch
 from app.pipeline.fingerprint import build_deterministic_header_fingerprint
 from app.pipeline.fingerprint import build_deterministic_layout_fingerprint
@@ -154,10 +164,16 @@ async def detect_document_headers(
             cell_map,
             pii_document_id_callback=pii_document_ids.append,
         )
+        pii_document_id = pii_document_ids[-1] if pii_document_ids else None
+        header_structure = await _restore_header_structure_placeholders(
+            header_structure,
+            pii_document_id,
+        )
         header_structure = apply_key_value_section_hints(
             header_structure,
             deterministic_key_value_sections,
         )
+        _raise_if_header_structure_has_placeholders(header_structure)
 
         flags = compare_with_deterministic_headers(
             header_structure,
@@ -228,6 +244,30 @@ async def detect_document_headers(
     except Exception as error:
         await _mark_document_failed(database, document_id, reason=str(error))
         raise
+
+
+async def _restore_header_structure_placeholders(
+    header_structure: HeaderStructure,
+    pii_document_id: str | None,
+) -> HeaderStructure:
+    if not pii_document_id:
+        return header_structure
+
+    serialized = json.dumps(header_structure, ensure_ascii=False)
+    normalized = normalize_placeholder_tokens(serialized)
+    if not contains_placeholder(normalized):
+        return header_structure
+
+    restored = await pii_restore(pii_document_id, json.loads(normalized))
+    return validate_header_structure(restored)
+
+
+def _raise_if_header_structure_has_placeholders(
+    header_structure: HeaderStructure,
+) -> None:
+    serialized = json.dumps(header_structure, ensure_ascii=False)
+    if contains_placeholder(normalize_placeholder_tokens(serialized)):
+        raise PiiServiceError("PII restore left placeholders in header structure.")
 
 
 async def _detect_known_schema(
@@ -597,6 +637,9 @@ def _apply_sheet_key_value_hints(
     inserted_hints = False
 
     for section in sections:
+        if _is_placeholder_key_value_section_matched_by_hint(section, hints):
+            continue
+
         section_title = _normalize_label(section.get("title") or "")
         if section_title in hint_titles:
             continue
@@ -646,6 +689,49 @@ def _is_collapsed_key_value_section(
         if isinstance(field, str) and _normalize_label(field) in hint_titles
     }
     return len(matched_titles) >= min(2, len(hint_titles))
+
+
+def _is_placeholder_key_value_section_matched_by_hint(
+    section: dict[str, Any],
+    hints: list[DetectedKeyValueSection],
+) -> bool:
+    if section.get("type") != "key_value":
+        return False
+
+    title = section.get("title")
+    if not isinstance(title, str):
+        return False
+
+    if not contains_placeholder(normalize_placeholder_tokens(title)):
+        return False
+
+    fields = section.get("fields", [])
+    if not isinstance(fields, list):
+        return False
+
+    section_fields = {_normalize_label(field) for field in fields if isinstance(field, str)}
+    if not section_fields:
+        return False
+
+    for hint in hints:
+        hint_field_values = hint.get("fields", [])
+        if not isinstance(hint_field_values, list):
+            continue
+
+        hint_fields = {
+            _normalize_label(field["name"])
+            for field in hint_field_values
+            if isinstance(field.get("name"), str)
+        }
+        if not hint_fields:
+            continue
+
+        overlap_count = len(section_fields & hint_fields)
+        required_overlap = min(2, len(section_fields), len(hint_fields))
+        if overlap_count >= required_overlap:
+            return True
+
+    return False
 
 
 def _first_table_section_index(sections: list[dict[str, Any]]) -> int:

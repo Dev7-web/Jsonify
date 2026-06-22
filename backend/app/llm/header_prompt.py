@@ -97,6 +97,7 @@ Flattened workbook:
 """
 
 CODE_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+HEADER_STRUCTURE_PARSE_ATTEMPTS = 2
 
 
 def build_header_detection_messages(flattened_text: str) -> tuple[str, str]:
@@ -129,14 +130,25 @@ async def adetect_header_structure_from_cell_map(
     *,
     pii_document_id_callback: Any | None = None,
 ) -> HeaderStructure:
-    response = await call_llm_with_pii(
-        SYSTEM_PROMPT,
-        cell_map,
-        build_user_prompt=build_header_detection_user_prompt,
-        pii_document_id_callback=pii_document_id_callback,
-        response_mime_type="application/json",
-    )
-    return parse_header_structure(response)
+    last_error: HeaderStructureParseError | None = None
+
+    for _ in range(HEADER_STRUCTURE_PARSE_ATTEMPTS):
+        response = await call_llm_with_pii(
+            SYSTEM_PROMPT,
+            cell_map,
+            build_user_prompt=build_header_detection_user_prompt,
+            pii_document_id_callback=pii_document_id_callback,
+            response_mime_type="application/json",
+        )
+        try:
+            return parse_header_structure(response)
+        except HeaderStructureParseError as error:
+            last_error = error
+
+    if last_error is not None:
+        raise last_error
+
+    raise HeaderStructureParseError("LLM response could not be parsed.")
 
 
 def parse_header_structure(raw_text: str) -> HeaderStructure:

@@ -11,6 +11,7 @@ from openpyxl import Workbook
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import app.llm.client as llm_client
+import app.pipeline.detect as detect_pipeline
 from app.models import Document
 from app.pii.adapt import contains_placeholder
 from app.pipeline.detect import detect_document_headers
@@ -83,6 +84,8 @@ def create_workbook(path: Path) -> None:
 
 
 async def main() -> None:
+    await check_post_parse_restore_before_hints()
+
     workbook_path = UPLOADS_DIR / WORKBOOK_NAME
     create_workbook(workbook_path)
 
@@ -124,6 +127,110 @@ async def main() -> None:
 
     print("Detect PII pipeline check passed.")
     print("PII document id stored:", bool(stored_document["pii_document_id"]))
+
+
+async def check_post_parse_restore_before_hints() -> None:
+    async def fake_pii_restore(document_id: str, payload: Any) -> Any:
+        assert document_id == "pii-doc-restore"
+        assert payload["sheets"][0]["sections"][0]["title"] == (
+            "<ORGANIZATION_bf09> Information"
+        )
+        return {
+            "sheets": [
+                {
+                    "name": "Renewal - 1st Renewal",
+                    "sections": [
+                        {
+                            "type": "key_value",
+                            "title": "Lease Information",
+                            "fields": ["DBA", "Lease"],
+                        }
+                    ],
+                }
+            ]
+        }
+
+    original_pii_restore = detect_pipeline.pii_restore
+    detect_pipeline.pii_restore = fake_pii_restore
+
+    try:
+        restored = await detect_pipeline._restore_header_structure_placeholders(
+            {
+                "sheets": [
+                    {
+                        "name": "Renewal - 1st Renewal",
+                        "sections": [
+                            {
+                                "type": "key_value",
+                                "title": "<ORGANIZATION_bf09> Information",
+                                "fields": ["DBA", "Lease"],
+                            }
+                        ],
+                    }
+                ]
+            },
+            "pii-doc-restore",
+        )
+    finally:
+        detect_pipeline.pii_restore = original_pii_restore
+
+    merged = detect_pipeline.apply_key_value_section_hints(
+        restored,
+        {
+            "Renewal - 1st Renewal": [
+                {
+                    "title": "Lease Information",
+                    "title_coordinate": "V4",
+                    "row_index": 4,
+                    "coordinate": "V4",
+                    "fields": [
+                        {"name": "DBA", "coordinate": "V5"},
+                        {"name": "Lease", "coordinate": "V6"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    sections = merged["sheets"][0]["sections"]
+    assert len(sections) == 1
+    assert sections[0]["title"] == "Lease Information"
+    detect_pipeline._raise_if_header_structure_has_placeholders(merged)
+
+    fallback_merged = detect_pipeline.apply_key_value_section_hints(
+        {
+            "sheets": [
+                {
+                    "name": "Renewal - 1st Renewal",
+                    "sections": [
+                        {
+                            "type": "key_value",
+                            "title": "<ORGANIZATION_bf09> Information",
+                            "fields": ["DBA", "Lease"],
+                        }
+                    ],
+                }
+            ]
+        },
+        {
+            "Renewal - 1st Renewal": [
+                {
+                    "title": "Lease Information",
+                    "title_coordinate": "V4",
+                    "row_index": 4,
+                    "coordinate": "V4",
+                    "fields": [
+                        {"name": "DBA", "coordinate": "V5"},
+                        {"name": "Lease", "coordinate": "V6"},
+                    ],
+                }
+            ]
+        },
+    )
+    fallback_sections = fallback_merged["sheets"][0]["sections"]
+    assert len(fallback_sections) == 1
+    assert fallback_sections[0]["title"] == "Lease Information"
+    detect_pipeline._raise_if_header_structure_has_placeholders(fallback_merged)
 
 
 if __name__ == "__main__":

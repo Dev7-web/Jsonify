@@ -10,6 +10,7 @@ from typing import Any
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import app.llm.client as llm_client
+import app.llm.header_prompt as header_prompt
 from app.pii.client import PiiServiceError
 
 
@@ -213,12 +214,38 @@ async def check_disabled_skips_pii() -> None:
     assert "Neha Rao" in captured_texts[0]
 
 
+async def check_header_detection_retries_invalid_json() -> None:
+    calls = 0
+
+    async def fake_call_llm_with_pii(*_: object, **__: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return '{"sheets":[{"name":"Sheet1","sections":[]}'
+
+        return '{"sheets":[{"name":"Sheet1","sections":[]}]}'
+
+    original_call_llm_with_pii = header_prompt.call_llm_with_pii
+    header_prompt.call_llm_with_pii = fake_call_llm_with_pii
+
+    try:
+        result = await header_prompt.adetect_header_structure_from_cell_map(
+            {"Sheet1!A1": "Header"},
+        )
+    finally:
+        header_prompt.call_llm_with_pii = original_call_llm_with_pii
+
+    assert calls == 2
+    assert result == {"sheets": [{"name": "Sheet1", "sections": []}]}
+
+
 async def main() -> None:
     await check_redact_before_gemini_and_skip_restore()
     await check_restore_when_placeholder_returns()
     await check_restore_when_json_escaped_placeholder_returns()
     await check_redact_failure_blocks_gemini()
     await check_disabled_skips_pii()
+    await check_header_detection_retries_invalid_json()
     print("LLM PII wrapper check passed.")
 
 

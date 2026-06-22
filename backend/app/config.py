@@ -56,6 +56,19 @@ def get_pii_timeout_seconds() -> float:
     return _get_float_env("PII_TIMEOUT_SECONDS", DEFAULT_PII_TIMEOUT_SECONDS)
 
 
+def get_llm_dump_dir() -> Path | None:
+    """When LLM_DUMP_PAYLOADS is on, return the folder where each LLM call's
+    exact system+user prompt is written. Returns None when disabled."""
+    if not _get_bool_env("LLM_DUMP_PAYLOADS", False):
+        return None
+
+    configured = os.getenv("LLM_DUMP_DIR")
+    if configured:
+        return Path(configured)
+
+    return BACKEND_ROOT / "llm_payloads"
+
+
 def _get_int_env(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:

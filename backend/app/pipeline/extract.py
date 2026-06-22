@@ -24,9 +24,11 @@ _SYNTHETIC_SECTION_TITLE_PATTERN = re.compile(
     r".+\s+section\s+\d+\s*$",
     re.IGNORECASE,
 )
-_LOCATOR_VERSION = 2
+_LOCATOR_VERSION = 3
 _LOCATOR_TYPE = "excel"
 _MAX_SECTION_SEARCH_ROWS = 80
+_REBO_COMMENT_OUTPUT_TITLE = "REBO Comment"
+_REBO_COMMENT_NORMALIZED_TITLES = {"rebo comment", "rebo comments"}
 
 
 class ExtractionResponse(TypedDict):
@@ -262,10 +264,16 @@ def extract_excel_with_locators(
 
             kind = section_locator.get("type")
             if kind == "key_value":
-                sheet_output[output_key] = _extract_key_value_section(
-                    grid,
-                    section_locator,
-                )
+                if _is_rebo_comment_section(section_locator):
+                    sheet_output[output_key] = _extract_rebo_comment_section(
+                        grid,
+                        section_locator,
+                    )
+                else:
+                    sheet_output[output_key] = _extract_key_value_section(
+                        grid,
+                        section_locator,
+                    )
             elif kind == "table":
                 sheet_output[output_key] = _extract_table_section(
                     grid,
@@ -293,6 +301,11 @@ def _locate_key_value_section(
         section_index,
         section_title_rows,
         row_count=len(grid),
+    )
+    title_cell = (
+        _find_section_title_cell(grid, title, start_row=start_row, end_row=end_row)
+        if title
+        else None
     )
 
     fields = section.get("fields", [])
@@ -356,6 +369,15 @@ def _locate_key_value_section(
         "section_index": section_index,
         "search_start_row": start_row,
         "search_end_row": end_row,
+        **(
+            {
+                "title_coordinate": title_cell["coordinate"],
+                "title_row_index": title_cell["row_index"],
+                "title_column_index": title_cell["column_index"],
+            }
+            if title_cell is not None
+            else {}
+        ),
         "fields": field_locators,
     }
 
@@ -612,6 +634,78 @@ def _extract_key_value_section(
         values[field_name] = _json_safe_value(value)
 
     return values
+
+
+def _extract_rebo_comment_section(
+    grid: Grid,
+    section_locator: dict[str, Any],
+) -> dict[str, Any]:
+    title_cell = _rebo_comment_title_cell(grid, section_locator)
+    if title_cell is None:
+        return {}
+
+    comments: dict[str, Any] = {}
+    title_row_index = title_cell["row_index"]
+    title_column_index = title_cell["column_index"]
+
+    for row_index in range(title_row_index + 1, len(grid) + 1):
+        row = grid[row_index - 1]
+        comment = _rebo_comment_value_for_row(row, title_column_index)
+        if comment is None:
+            continue
+
+        comments[f"row_{row_index}"] = comment
+
+    return comments
+
+
+def _rebo_comment_title_cell(
+    grid: Grid,
+    section_locator: dict[str, Any],
+) -> dict[str, Any] | None:
+    row_index = section_locator.get("title_row_index")
+    column_index = section_locator.get("title_column_index")
+    if isinstance(row_index, int) and isinstance(column_index, int):
+        return {
+            "row_index": row_index,
+            "column_index": column_index,
+            "coordinate": _coordinate(row_index, column_index),
+        }
+
+    title = _optional_string(section_locator.get("title")) or _REBO_COMMENT_OUTPUT_TITLE
+    return _find_section_title_cell(grid, title, start_row=1, end_row=len(grid))
+
+
+def _rebo_comment_value_for_row(
+    row: list[Any | None],
+    title_column_index: int,
+) -> Any | None:
+    values: list[Any] = []
+    seen: set[str] = set()
+
+    for column_offset in range(max(title_column_index - 1, 0), len(row)):
+        value = row[column_offset]
+        if _is_empty(value):
+            continue
+
+        normalized = _normalize_label(value)
+        if normalized in _REBO_COMMENT_NORMALIZED_TITLES:
+            continue
+
+        dedupe_key = normalized or str(value).strip()
+        if dedupe_key in seen:
+            continue
+
+        seen.add(dedupe_key)
+        values.append(_json_safe_value(value))
+
+    if not values:
+        return None
+
+    if len(values) == 1:
+        return values[0]
+
+    return " | ".join(str(value) for value in values if value is not None)
 
 
 def _extract_table_section(
@@ -890,6 +984,15 @@ def _section_output_title(section_locator: dict[str, Any]) -> str:
         return f"Section {section_index + 1}"
 
     return "Section"
+
+
+def _is_rebo_comment_section(section_locator: dict[str, Any]) -> bool:
+    output_title = _optional_string(section_locator.get("output_title"))
+    if output_title and _normalize_label(output_title) in _REBO_COMMENT_NORMALIZED_TITLES:
+        return True
+
+    title = _optional_string(section_locator.get("title"))
+    return bool(title and _normalize_label(title) in _REBO_COMMENT_NORMALIZED_TITLES)
 
 
 def _unique_key(existing: dict[str, Any], preferred_key: str) -> str:

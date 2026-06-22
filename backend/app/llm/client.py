@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import Final
 
 from google import genai
@@ -11,6 +12,7 @@ from google.genai import errors, types
 
 from app.config import (
     DEFAULT_LLM_TEMPERATURE,
+    get_llm_dump_dir,
     get_llm_max_retries,
     get_llm_model,
     get_llm_retry_base_seconds,
@@ -117,9 +119,11 @@ async def call_llm_with_pii(
     prompt_builder = build_user_prompt or (lambda flattened_text: flattened_text)
 
     if not get_pii_enabled():
+        user_prompt = prompt_builder(cell_map_to_llm_text(cell_map))
+        _maybe_dump_llm_payload(system, user_prompt, label="noredact")
         return await gemini_call(
             system,
-            prompt_builder(cell_map_to_llm_text(cell_map)),
+            user_prompt,
             model=model,
             temperature=temperature,
             max_retries=max_retries,
@@ -134,9 +138,11 @@ async def call_llm_with_pii(
     if not isinstance(redacted_map, dict):
         raise PiiServiceError("PII redact response data must be a JSON object.")
 
+    user_prompt = prompt_builder(cell_map_to_llm_text(redacted_map))
+    _maybe_dump_llm_payload(system, user_prompt, label=document_id)
     raw = await gemini_call(
         system,
-        prompt_builder(cell_map_to_llm_text(redacted_map)),
+        user_prompt,
         model=model,
         temperature=temperature,
         max_retries=max_retries,
@@ -160,6 +166,33 @@ def _validate_prompts(system: str, user: str) -> None:
 
     if not user.strip():
         raise ValueError("user prompt must not be empty.")
+
+
+def _maybe_dump_llm_payload(system: str, user: str, *, label: str) -> None:
+    """When LLM_DUMP_PAYLOADS is enabled, write the exact system+user prompt
+    to disk so it can be shown to clients. Best-effort: never breaks the call."""
+    dump_dir = get_llm_dump_dir()
+    if dump_dir is None:
+        return
+
+    try:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)
+        path = dump_dir / f"{stamp}_{safe_label}.txt"
+        path.write_text(
+            "===== WHAT IS SENT TO THE LLM =====\n"
+            f"Captured  : {stamp}\n"
+            f"Label     : {label}\n"
+            "\n----- SYSTEM PROMPT -----\n"
+            f"{system}\n"
+            "----- USER PROMPT -----\n"
+            f"{user}\n",
+            encoding="utf-8",
+        )
+        logger.info("LLM payload dumped to %s", path)
+    except OSError as error:
+        logger.warning("Could not dump LLM payload: %s", error)
 
 
 def _get_client() -> genai.Client:
