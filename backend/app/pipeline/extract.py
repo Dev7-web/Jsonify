@@ -24,11 +24,12 @@ _SYNTHETIC_SECTION_TITLE_PATTERN = re.compile(
     r".+\s+section\s+\d+\s*$",
     re.IGNORECASE,
 )
-_LOCATOR_VERSION = 3
+_LOCATOR_VERSION = 5
 _LOCATOR_TYPE = "excel"
 _MAX_SECTION_SEARCH_ROWS = 80
 _REBO_COMMENT_OUTPUT_TITLE = "REBO Comment"
 _REBO_COMMENT_NORMALIZED_TITLES = {"rebo comment", "rebo comments"}
+_PRESERVED_SYNTHETIC_FIELD_LABELS = {"tenant:", "landlord:"}
 
 
 class ExtractionResponse(TypedDict):
@@ -365,7 +366,7 @@ def _locate_key_value_section(
     return {
         "type": "key_value",
         "title": title,
-        "output_title": _normalize_section_title_for_output(title),
+        "output_title": _key_value_section_output_title(title, field_names),
         "section_index": section_index,
         "search_start_row": start_row,
         "search_end_row": end_row,
@@ -412,7 +413,7 @@ def _is_unanchored_synthetic_metadata_section(
         return False
 
     if not all(
-        isinstance(field, str) and _is_table_metadata_label(field)
+        isinstance(field, str) and _is_synthetic_metadata_field_label(field)
         for field in fields
     ):
         return False
@@ -422,6 +423,14 @@ def _is_unanchored_synthetic_metadata_section(
 
 def _looks_like_synthetic_section_title(title: str) -> bool:
     return _SYNTHETIC_SECTION_TITLE_PATTERN.fullmatch(title.strip()) is not None
+
+
+def _is_synthetic_metadata_field_label(value: str) -> bool:
+    normalized = _normalize_label(value).replace(" :", ":")
+    if not normalized.endswith(":"):
+        return False
+
+    return normalized not in _PRESERVED_SYNTHETIC_FIELD_LABELS
 
 
 def _locate_table_section(
@@ -1041,6 +1050,21 @@ def _normalize_section_title_for_output(title: str | None) -> str | None:
         return "Lease Information"
 
     return title
+
+
+def _key_value_section_output_title(
+    title: str | None,
+    field_names: list[str],
+) -> str | None:
+    if title and _looks_like_synthetic_section_title(title):
+        normalized_fields = {
+            _normalize_label(field_name).replace(" :", ":")
+            for field_name in field_names
+        }
+        if {"tenant:", "landlord:"}.issubset(normalized_fields):
+            return "Lease Information"
+
+    return _normalize_section_title_for_output(title)
 
 
 def _resolve_stored_path(stored_path: str) -> Path:

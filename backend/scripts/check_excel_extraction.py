@@ -171,7 +171,7 @@ PACIFIC_HEADER_STRUCTURE = {
             "sections": [
                 {
                     "type": "key_value",
-                    "title": "Lease Information: Uplift Family Services a California 501c3 at {{Property Name_subsummarization}}",
+                    "title": "Lease_Abstract (1) section 1",
                     "fields": ["Tenant:", "Landlord:"],
                 },
                 {
@@ -221,6 +221,27 @@ PACIFIC_HEADER_STRUCTURE = {
                     "type": "key_value",
                     "title": "Lease_Abstract (1) section 9",
                     "fields": ["Notes :"],
+                },
+                {
+                    "type": "table",
+                    "title": "Termination Options:",
+                    "headers": [
+                        {"name": "Description"},
+                        {"name": "First Notice Date"},
+                        {"name": "Last Notice Date"},
+                        {"name": "Notice Period"},
+                        {"name": "Fee"},
+                    ],
+                },
+                {
+                    "type": "key_value",
+                    "title": "Lease_Abstract (1) section 19",
+                    "fields": [
+                        "Termination Notes :",
+                        "First Offer or Refusal :",
+                        "Purchase :",
+                        "Relocation :",
+                    ],
                 },
             ],
         }
@@ -394,6 +415,68 @@ def create_pacific_workbook(
             "Add.,Art.51&56: TT shall pay operating expenses as additional rent.",
         ]
     )
+    worksheet.append([])
+    worksheet.append(
+        [
+            None,
+            "Termination Options:",
+            "Termination Options:",
+            "Termination Options:",
+            "Termination Options:",
+            "Termination Options:",
+        ]
+    )
+    worksheet.append(
+        [
+            None,
+            "Description",
+            "First Notice Date",
+            "Last Notice Date",
+            "Notice Period",
+            "Fee",
+        ]
+    )
+    worksheet.append([None, "Lease is Silent", None, None, None, None])
+    worksheet.append(
+        [
+            None,
+            "Termination Notes :",
+            "{{Termination Notes_subsection no}}: {{Termination Notes_subsummarization}}",
+            "{{Termination Notes_subsection no}}: {{Termination Notes_subsummarization}}",
+            "{{Termination Notes_subsection no}}: {{Termination Notes_subsummarization}}",
+            "{{Termination Notes_subsection no}}: {{Termination Notes_subsummarization}}",
+        ]
+    )
+    worksheet.append(
+        [
+            None,
+            "First Offer or Refusal :",
+            "Art. 39: Lease is Silent",
+            "Art. 39: Lease is Silent",
+            "Art. 39: Lease is Silent",
+            "Art. 39: Lease is Silent",
+        ]
+    )
+    worksheet.append(
+        [
+            None,
+            "Purchase :",
+            "Art. 12: Lease is Silent",
+            "Art. 12: Lease is Silent",
+            "Art. 12: Lease is Silent",
+            "Art. 12: Lease is Silent",
+        ]
+    )
+    worksheet.append(
+        [
+            None,
+            "Relocation :",
+            "Lease is Silent",
+            "Lease is Silent",
+            "Lease is Silent",
+            "Lease is Silent",
+        ]
+    )
 
     workbook.save(path)
 
@@ -436,7 +519,7 @@ async def main() -> None:
     assert "field_locators" in fake_db.schemas.records[schema.id]
     assert fake_db.documents.records[document.id]["status"] == "extracted"
     assert fake_db.documents.records[document.id]["output_json"] == output_json
-    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 3
+    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 5
     assert (
         fake_db.documents.records[document.id]["extraction_locators"]["schema_id"]
         == schema.id
@@ -531,6 +614,7 @@ async def main() -> None:
     assert matched_sheet["Lease Information"]["Landlord:"] == (
         "Hillandale Drive Properties, LLC"
     )
+    assert "Lease_Abstract (1) section 1" not in matched_sheet
     assert matched_sheet["Property Information:"]["Address 2 :"] is None
     assert matched_sheet["Property Information:"]["Zip :"] == "90670"
     assert matched_sheet["Term Information:"] == [
@@ -571,6 +655,25 @@ async def main() -> None:
         ),
     }
     assert "Lease_Abstract (1) section 9" not in matched_sheet
+    assert matched_sheet["Termination Options:"] == {
+        "rows": [
+            {
+                "Description": "Lease is Silent",
+                "First Notice Date": None,
+                "Last Notice Date": None,
+                "Notice Period": None,
+                "Fee": None,
+            }
+        ],
+        "Termination Notes :": (
+            "{{Termination Notes_subsection no}}: "
+            "{{Termination Notes_subsummarization}}"
+        ),
+        "First Offer or Refusal :": "Art. 39: Lease is Silent",
+        "Purchase :": "Art. 12: Lease is Silent",
+        "Relocation :": "Lease is Silent",
+    }
+    assert "Lease_Abstract (1) section 19" not in matched_sheet
     assert source_result["locators_created"] is True
     assert matched_result["locators_created"] is True
     assert (
