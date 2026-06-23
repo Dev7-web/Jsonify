@@ -24,12 +24,11 @@ _SYNTHETIC_SECTION_TITLE_PATTERN = re.compile(
     r".+\s+section\s+\d+\s*$",
     re.IGNORECASE,
 )
-_LOCATOR_VERSION = 5
+_LOCATOR_VERSION = 6
 _LOCATOR_TYPE = "excel"
 _MAX_SECTION_SEARCH_ROWS = 80
 _REBO_COMMENT_OUTPUT_TITLE = "REBO Comment"
 _REBO_COMMENT_NORMALIZED_TITLES = {"rebo comment", "rebo comments"}
-_PRESERVED_SYNTHETIC_FIELD_LABELS = {"tenant:", "landlord:"}
 
 
 class ExtractionResponse(TypedDict):
@@ -366,7 +365,11 @@ def _locate_key_value_section(
     return {
         "type": "key_value",
         "title": title,
-        "output_title": _key_value_section_output_title(title, field_names),
+        "output_title": _key_value_section_output_title(
+            grid,
+            title,
+            field_locators,
+        ),
         "section_index": section_index,
         "search_start_row": start_row,
         "search_end_row": end_row,
@@ -387,12 +390,21 @@ def _workbook_supported_sections(
     grid: Grid,
     sections: list[Any],
 ) -> list[Any]:
+    table_metadata_labels_by_section = _collect_table_metadata_labels_by_section(
+        grid,
+        sections,
+    )
     return [
         section
-        for section in sections
+        for section_index, section in enumerate(sections)
         if not (
             isinstance(section, dict)
-            and _is_unanchored_synthetic_metadata_section(grid, section)
+            and _is_unanchored_synthetic_metadata_section(
+                grid,
+                section,
+                section_index=section_index,
+                table_metadata_labels_by_section=table_metadata_labels_by_section,
+            )
         )
     ]
 
@@ -400,6 +412,9 @@ def _workbook_supported_sections(
 def _is_unanchored_synthetic_metadata_section(
     grid: Grid,
     section: dict[str, Any],
+    *,
+    section_index: int,
+    table_metadata_labels_by_section: dict[int, set[str]],
 ) -> bool:
     if section.get("type") != "key_value":
         return False
@@ -412,25 +427,122 @@ def _is_unanchored_synthetic_metadata_section(
     if not isinstance(fields, list) or not fields:
         return False
 
-    if not all(
-        isinstance(field, str) and _is_synthetic_metadata_field_label(field)
+    field_labels = {_normalize_label(field).replace(" :", ":") for field in fields}
+    if "" in field_labels or not all(
+        isinstance(field, str) and _is_table_metadata_label(field)
         for field in fields
     ):
         return False
 
-    return _find_section_title_cell(grid, title, start_row=1, end_row=len(grid)) is None
+    if _find_section_title_cell(grid, title, start_row=1, end_row=len(grid)) is not None:
+        return False
+
+    previous_table_labels = _nearest_previous_table_metadata_labels(
+        section_index,
+        table_metadata_labels_by_section,
+    )
+    return previous_table_labels is not None and field_labels <= previous_table_labels
 
 
 def _looks_like_synthetic_section_title(title: str) -> bool:
     return _SYNTHETIC_SECTION_TITLE_PATTERN.fullmatch(title.strip()) is not None
 
 
-def _is_synthetic_metadata_field_label(value: str) -> bool:
-    normalized = _normalize_label(value).replace(" :", ":")
-    if not normalized.endswith(":"):
-        return False
+def _collect_table_metadata_labels_by_section(
+    grid: Grid,
+    sections: list[Any],
+) -> dict[int, set[str]]:
+    section_title_rows = _collect_section_title_rows(grid, sections)
+    labels_by_section: dict[int, set[str]] = {}
 
-    return normalized not in _PRESERVED_SYNTHETIC_FIELD_LABELS
+    for section_index, section in enumerate(sections):
+        if not isinstance(section, dict) or section.get("type") != "table":
+            continue
+
+        try:
+            column_specs = _table_column_specs(section.get("headers", []))
+            if not column_specs:
+                continue
+
+            start_row, end_row = _section_search_bounds(
+                section_index,
+                section_title_rows,
+                row_count=len(grid),
+            )
+            header_row = _find_table_header_row(
+                grid,
+                column_specs,
+                start_row=start_row,
+                end_row=end_row,
+            )
+            if header_row is None:
+                continue
+
+            columns = []
+            for column_spec in column_specs:
+                column_index = header_row["columns_by_name"].get(
+                    column_spec["match_key"]
+                )
+                if column_index is None:
+                    continue
+
+                columns.append(
+                    {
+                        "name": column_spec["output_name"],
+                        "source_header": column_spec["source_name"],
+                        "column_index": column_index,
+                        "coordinate": _coordinate(header_row["row_index"], column_index),
+                    }
+                )
+
+            if not columns:
+                continue
+
+            labels = _collect_table_metadata_labels(
+                grid,
+                header_row_index=header_row["row_index"],
+                data_end_row_index=end_row,
+                columns=columns,
+            )
+            if labels:
+                labels_by_section[section_index] = labels
+        except ExtractLocatorError:
+            continue
+
+    return labels_by_section
+
+
+def _collect_table_metadata_labels(
+    grid: Grid,
+    *,
+    header_row_index: int,
+    data_end_row_index: int,
+    columns: list[dict[str, Any]],
+) -> set[str]:
+    labels: set[str] = set()
+    row_index = header_row_index + 1
+    row_limit = min(data_end_row_index, len(grid))
+
+    while row_index <= row_limit:
+        row = grid[row_index - 1]
+        metadata_row = _table_metadata_row(row, columns)
+        if metadata_row is not None:
+            labels.add(_normalize_label(metadata_row["name"]).replace(" :", ":"))
+
+        row_index += 1
+
+    return labels
+
+
+def _nearest_previous_table_metadata_labels(
+    section_index: int,
+    table_metadata_labels_by_section: dict[int, set[str]],
+) -> set[str] | None:
+    for table_section_index in sorted(table_metadata_labels_by_section, reverse=True):
+        if table_section_index < section_index:
+            return table_metadata_labels_by_section[table_section_index]
+
+    return None
 
 
 def _locate_table_section(
@@ -1053,18 +1165,61 @@ def _normalize_section_title_for_output(title: str | None) -> str | None:
 
 
 def _key_value_section_output_title(
+    grid: Grid,
     title: str | None,
-    field_names: list[str],
+    field_locators: list[dict[str, Any]],
 ) -> str | None:
     if title and _looks_like_synthetic_section_title(title):
-        normalized_fields = {
-            _normalize_label(field_name).replace(" :", ":")
-            for field_name in field_names
-        }
-        if {"tenant:", "landlord:"}.issubset(normalized_fields):
-            return "Lease Information"
+        inferred_title = _infer_synthetic_key_value_section_title(
+            grid,
+            field_locators,
+        )
+        if inferred_title is not None:
+            return inferred_title
 
     return _normalize_section_title_for_output(title)
+
+
+def _infer_synthetic_key_value_section_title(
+    grid: Grid,
+    field_locators: list[dict[str, Any]],
+) -> str | None:
+    candidate_counts: dict[str, int] = {}
+    candidate_texts: dict[str, str] = {}
+
+    for field_locator in field_locators:
+        row_index = field_locator.get("label_row_index")
+        label_column_index = field_locator.get("label_column_index")
+        if not isinstance(row_index, int) or not isinstance(label_column_index, int):
+            continue
+
+        row = grid[row_index - 1]
+        seen_on_row: set[str] = set()
+        for column_index in range(1, label_column_index):
+            value = _cell_at_row(row, column_index)
+            normalized = _normalize_label(value)
+            if not normalized or normalized in seen_on_row:
+                continue
+
+            seen_on_row.add(normalized)
+            text = str(_json_safe_value(value)).strip()
+            if not text or _looks_like_synthetic_section_title(text):
+                continue
+
+            candidate_counts[normalized] = candidate_counts.get(normalized, 0) + 1
+            candidate_texts.setdefault(normalized, text)
+
+    if not candidate_counts:
+        return None
+
+    best_normalized = max(
+        candidate_counts,
+        key=lambda normalized: (
+            candidate_counts[normalized],
+            len(candidate_texts[normalized]),
+        ),
+    )
+    return _normalize_section_title_for_output(candidate_texts[best_normalized])
 
 
 def _resolve_stored_path(stored_path: str) -> Path:

@@ -519,7 +519,7 @@ async def main() -> None:
     assert "field_locators" in fake_db.schemas.records[schema.id]
     assert fake_db.documents.records[document.id]["status"] == "extracted"
     assert fake_db.documents.records[document.id]["output_json"] == output_json
-    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 5
+    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 6
     assert (
         fake_db.documents.records[document.id]["extraction_locators"]["schema_id"]
         == schema.id
