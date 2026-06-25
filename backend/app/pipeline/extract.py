@@ -20,6 +20,8 @@ ExtractedJson = dict[str, Any]
 
 _RESOLVED_BACKEND_ROOT = BACKEND_ROOT.resolve()
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+_PLACEHOLDER_TOKEN_PATTERN = re.compile(r"\{\{[^{}]*\}\}")
+_ALNUM_PATTERN = re.compile(r"[^\W_]")
 _SYNTHETIC_SECTION_TITLE_PATTERN = re.compile(
     r".+\s+section\s+\d+\s*$",
     re.IGNORECASE,
@@ -1202,7 +1204,11 @@ def _infer_synthetic_key_value_section_title(
                 continue
 
             seen_on_row.add(normalized)
-            text = str(_json_safe_value(value)).strip()
+            safe_value = _json_safe_value(value)
+            if safe_value is None:
+                continue
+
+            text = str(safe_value).strip()
             if not text or _looks_like_synthetic_section_title(text):
                 continue
 
@@ -1269,8 +1275,22 @@ def _cell_at_row(row: list[Any | None], column_index: int) -> Any | None:
     return row[column_offset]
 
 
+def _is_placeholder_only_value(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    if not _PLACEHOLDER_TOKEN_PATTERN.search(value):
+        return False
+
+    remainder = _PLACEHOLDER_TOKEN_PATTERN.sub("", value)
+    return _ALNUM_PATTERN.search(remainder) is None
+
+
 def _json_safe_value(value: Any) -> Any:
     if value is None:
+        return None
+
+    if _is_placeholder_only_value(value):
         return None
 
     if isinstance(value, datetime):

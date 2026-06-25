@@ -177,7 +177,14 @@ PACIFIC_HEADER_STRUCTURE = {
                 {
                     "type": "key_value",
                     "title": "Property Information:",
-                    "fields": ["Address 2 :", "Zip :"],
+                    "fields": [
+                        "Address 2 :",
+                        "Zip :",
+                        "Property Name :",
+                        "Suite Store :",
+                        "Country :",
+                        "Currency :",
+                    ],
                 },
                 {
                     "type": "table",
@@ -301,6 +308,28 @@ def create_pacific_workbook(
         ]
     )
     worksheet.append([None, "Address 2 :", None, None, None, None, "Zip :", zip_code])
+    # Single placeholder -> null.
+    worksheet.append([None, "Property Name :", "{{Property Name_subsummarization}}"])
+    # Two placeholders joined by a separator -> null.
+    worksheet.append(
+        [
+            None,
+            "Suite Store :",
+            "{{Suite Store_subsection no}}: {{Suite Store_subsummarization}}",
+        ]
+    )
+    # Multiline placeholders (loader collapses the newline) -> null.
+    worksheet.append(
+        [
+            None,
+            "Country :",
+            "{{Country Line One_subsummarization}}\n{{Country Line Two_subsummarization}}",
+        ]
+    )
+    # Mixed real text + placeholder -> preserved unchanged.
+    worksheet.append(
+        [None, "Currency :", "Article 12 - {{Currency Notes_subsummarization}}"]
+    )
     worksheet.append([])
     worksheet.append(
         [
@@ -617,6 +646,14 @@ async def main() -> None:
     assert "Lease_Abstract (1) section 1" not in matched_sheet
     assert matched_sheet["Property Information:"]["Address 2 :"] is None
     assert matched_sheet["Property Information:"]["Zip :"] == "90670"
+    # Single placeholder, separator-joined placeholders, and multiline
+    # placeholders all normalize to null; mixed content is preserved.
+    assert matched_sheet["Property Information:"]["Property Name :"] is None
+    assert matched_sheet["Property Information:"]["Suite Store :"] is None
+    assert matched_sheet["Property Information:"]["Country :"] is None
+    assert matched_sheet["Property Information:"]["Currency :"] == (
+        "Article 12 - {{Currency Notes_subsummarization}}"
+    )
     assert matched_sheet["Term Information:"] == [
         {
             "Description": "Current Term",
@@ -645,9 +682,9 @@ async def main() -> None:
                 "Begin Date": "01/04/2024",
                 "End Date": "03/31/2027",
                 "Type": "Net",
-                "Pro-rata share": "{{Pro Rata Share Financial_subsummarization}}",
-                "Base Year": "{{Base Year_subsummarization}}",
-                "Cap": "{{CAP_subsummarization}}",
+                "Pro-rata share": None,
+                "Base Year": None,
+                "Cap": None,
             }
         ],
         "Notes :": (
@@ -665,10 +702,7 @@ async def main() -> None:
                 "Fee": None,
             }
         ],
-        "Termination Notes :": (
-            "{{Termination Notes_subsection no}}: "
-            "{{Termination Notes_subsummarization}}"
-        ),
+        "Termination Notes :": None,
         "First Offer or Refusal :": "Art. 39: Lease is Silent",
         "Purchase :": "Art. 12: Lease is Silent",
         "Relocation :": "Lease is Silent",
