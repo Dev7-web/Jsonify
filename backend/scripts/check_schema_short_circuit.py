@@ -1,4 +1,5 @@
 import asyncio
+from copy import deepcopy
 from pathlib import Path
 import sys
 from typing import Any
@@ -12,6 +13,7 @@ from app.models import Document, DocumentSchema
 from app.parsing.excel_loader import load_sheets
 from app.parsing.form_detector import detect_key_value_sections
 from app.parsing.header_detector import detect_table_headers
+from app.parsing.matrix_detector import detect_matrices
 from app.pipeline import detect as detect_pipeline
 from app.pipeline.fingerprint import build_deterministic_layout_fingerprint
 from app.pipeline.fingerprint import build_header_structure_fingerprint
@@ -51,7 +53,20 @@ APPROVED_HEADER_STRUCTURE = {
                     ],
                 },
             ],
-        }
+        },
+        {
+            "name": "Tenant Contact",
+            "sections": [
+                {
+                    "type": "matrix",
+                    "title": "LEASE/CONTACT INFORMATION:",
+                    "headers": [
+                        {"name": "Billing Contact"},
+                        {"name": "Notice Address"},
+                    ],
+                }
+            ],
+        },
     ]
 }
 
@@ -163,19 +178,57 @@ def create_workbook(path: Path) -> None:
     worksheet["E7"] = 1000
     worksheet["F7"] = 12000
 
+    contact_sheet = workbook.create_sheet("Tenant Contact")
+    contact_sheet["B2"] = "LEASE/CONTACT INFORMATION:"
+    contact_sheet["E3"] = "Billing Contact"
+    contact_sheet["H3"] = "Notice Address"
+    contact_sheet["B4"] = "Phone Number:"
+    contact_sheet["H4"] = "757-321-5000"
+    contact_sheet["B5"] = "Email Address:"
+    contact_sheet["E5"] = "billing@example.com"
+    contact_sheet["B6"] = "Address:"
+    contact_sheet["E6"] = "500 Volvo Parkway"
+    contact_sheet["H6"] = "500 Volvo Parkway"
+
     workbook.save(path)
 
 
 def create_deterministic_fingerprint(path: Path) -> str:
-    deterministic_headers = {
-        sheet_name: detect_pipeline._deduplicate_headers(detect_table_headers(grid))
-        for sheet_name, grid in load_sheets(path).items()
+    sheets = load_sheets(path)
+    deterministic_matrices = {
+        sheet_name: detect_matrices(grid)
+        for sheet_name, grid in sheets.items()
     }
-    deterministic_key_value_sections = detect_key_value_sections(path)
+    deterministic_headers = {
+        sheet_name: detect_pipeline._deduplicate_headers(
+            [
+                header
+                for header in detect_table_headers(grid)
+                if not detect_pipeline._header_overlaps_matrix(
+                    header,
+                    deterministic_matrices[sheet_name],
+                )
+            ]
+        )
+        for sheet_name, grid in sheets.items()
+    }
+    detected_key_value_sections = detect_key_value_sections(path)
+    deterministic_key_value_sections = {
+        sheet_name: [
+            section
+            for section in sections
+            if not detect_pipeline._key_value_section_overlaps_matrix(
+                section,
+                deterministic_matrices.get(sheet_name, []),
+            )
+        ]
+        for sheet_name, sections in detected_key_value_sections.items()
+    }
 
     return build_deterministic_layout_fingerprint(
         deterministic_headers,
         deterministic_key_value_sections,
+        deterministic_matrices,
     ).fingerprint
 
 
@@ -242,7 +295,9 @@ async def check_no_match_uses_llm() -> None:
     async def fake_llm(*_: object, **__: object):
         nonlocal llm_calls
         llm_calls += 1
-        return APPROVED_HEADER_STRUCTURE
+        llm_structure = deepcopy(APPROVED_HEADER_STRUCTURE)
+        llm_structure["sheets"][1]["sections"][0]["type"] = "table"
+        return llm_structure
 
     original_llm = detect_pipeline.adetect_header_structure_from_cell_map
     detect_pipeline.adetect_header_structure_from_cell_map = fake_llm
@@ -260,6 +315,14 @@ async def check_no_match_uses_llm() -> None:
     assert result["status"] == "needs_review"
     assert stored_document["status"] == "needs_review"
     assert stored_document["detected_headers"]["source"] == "llm"
+    detected_sheets = result["detected_headers"]["header_structure"]["sheets"]
+    contact_section = detected_sheets[1]["sections"][0]
+    assert contact_section["type"] == "matrix"
+    assert [header["name"] for header in contact_section["headers"]] == [
+        "Billing Contact",
+        "Notice Address",
+    ]
+    assert result["detected_headers"]["deterministic_matrices"]["Tenant Contact"]
 
     print("LLM fallback branch passed.")
     print(f"Source: {result['source']}")

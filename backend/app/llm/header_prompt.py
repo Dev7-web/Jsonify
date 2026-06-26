@@ -7,7 +7,7 @@ from typing import Any, Literal, TypedDict, cast
 from app.llm.client import acall_llm, call_llm, call_llm_with_pii
 
 
-SectionType = Literal["key_value", "table"]
+SectionType = Literal["key_value", "table", "matrix"]
 
 
 class HeaderNode(TypedDict, total=False):
@@ -20,6 +20,7 @@ class LayoutSection(TypedDict, total=False):
     title: str
     fields: list[str]
     headers: list[HeaderNode]
+    row_header: str
 
 
 class SheetLayout(TypedDict):
@@ -43,6 +44,9 @@ Copy header, field, and section text verbatim from the provided cells.
 Do not invent labels that are not present in the flattened workbook text.
 Represent form-style areas as type "key_value".
 Represent column-header tables as type "table".
+Represent two-dimensional comparison grids as type "matrix". A matrix has
+reusable row labels down the left and two or more comparison headers across
+the top, so each value is identified by both a row label and a column header.
 Use nested "subheaders" only when the workbook visually groups columns under a parent header.
 When form-style group titles appear inside a larger page title, each group title is
 its own key_value section. Do not put group titles inside another section's fields.
@@ -73,6 +77,14 @@ Return JSON in exactly this shape:
               ]
             }
           ]
+        },
+        {
+          "type": "matrix",
+          "title": "Section title copied exactly",
+          "row_header": "Optional visible heading for the row-label column",
+          "headers": [
+            { "name": "Comparison column header copied exactly" }
+          ]
         }
       ]
     }
@@ -88,6 +100,12 @@ Rules:
 - Do not use a larger page/report title as the section title when smaller group titles contain the actual field labels.
 - Do not include sibling group titles as fields. Example: if "Amendment Information" and "Lease Information" are group titles, they should be section titles, not fields under "Amendment Abstract".
 - For "table" sections, include column headers in left-to-right order.
+- For "matrix" sections, include only the horizontal comparison headers in
+  "headers". Do not include the row labels as headers.
+- Use "matrix" only when at least two horizontal comparison headers share at
+  least two reusable row-label rows. A normal record table remains "table".
+- Omit "row_header" when the top-left matrix cell is blank or there is no
+  visible heading above the row-label column.
 - If a section or table has no visible title in the cells, omit the "title" key; never return an empty title.
 - Preserve the exact sheet names from lines that start with "## Sheet:".
 - Preserve exact header text from the cells, but omit cell coordinates in the JSON.
@@ -202,9 +220,9 @@ def _validate_section(value: Any, location: str) -> LayoutSection:
         raise HeaderStructureParseError(f"{location} must be an object.")
 
     section_type = value.get("type")
-    if section_type not in ("key_value", "table"):
+    if section_type not in ("key_value", "table", "matrix"):
         raise HeaderStructureParseError(
-            f'{location}.type must be either "key_value" or "table".'
+            f'{location}.type must be "key_value", "table", or "matrix".'
         )
 
     title = _normalize_optional_title(value.get("title"), location)
@@ -219,6 +237,19 @@ def _validate_section(value: Any, location: str) -> LayoutSection:
         return section
 
     headers = _validate_header_list(value.get("headers"), f"{location}.headers")
+    if section_type == "matrix":
+        if any(header.get("subheaders") for header in headers):
+            raise HeaderStructureParseError(
+                f"{location}.headers must use single-row headers for a matrix."
+            )
+
+        row_header = _normalize_optional_string(
+            value.get("row_header"),
+            f"{location}.row_header",
+        )
+        if row_header is not None:
+            section["row_header"] = row_header
+
     section["headers"] = headers
     return section
 
@@ -297,3 +328,14 @@ def _normalize_optional_title(value: Any, location: str) -> str | None:
         return None
 
     return title
+
+
+def _normalize_optional_string(value: Any, location: str) -> str | None:
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise HeaderStructureParseError(f"{location} must be a string when present.")
+
+    normalized = value.strip()
+    return normalized or None

@@ -18,6 +18,7 @@ from app.models import Document
 from app.parsing.excel_loader import load_sheets
 from app.parsing.form_detector import DetectedKeyValueSection, detect_key_value_sections
 from app.parsing.header_detector import DetectedHeader, detect_table_headers
+from app.parsing.matrix_detector import DetectedMatrix, detect_matrices
 from app.pii.adapt import (
     contains_placeholder,
     excel_path_to_cell_map,
@@ -55,6 +56,7 @@ class DetectionResult(TypedDict, total=False):
     header_structure: HeaderStructure
     deterministic_headers: dict[str, list[DetectedHeader]]
     deterministic_key_value_sections: dict[str, list[DetectedKeyValueSection]]
+    deterministic_matrices: dict[str, list[DetectedMatrix]]
     deterministic_fingerprint: str
     flags: list[DetectionFlag]
     confidence: float
@@ -139,13 +141,17 @@ async def detect_document_headers(
 
     try:
         workbook_path = _resolve_stored_path(document.stored_path)
-        deterministic_headers = _detect_deterministic_headers(workbook_path)
+        deterministic_headers, deterministic_matrices = (
+            _detect_deterministic_tabular_layout(workbook_path)
+        )
         deterministic_key_value_sections = _detect_deterministic_key_value_sections(
             workbook_path,
+            deterministic_matrices,
         )
         deterministic_fingerprint = _build_deterministic_layout_match_fingerprint(
             deterministic_headers,
             deterministic_key_value_sections,
+            deterministic_matrices,
         )
 
         schema_response = await _detect_known_schema(
@@ -153,6 +159,7 @@ async def detect_document_headers(
             document=document,
             deterministic_headers=deterministic_headers,
             deterministic_key_value_sections=deterministic_key_value_sections,
+            deterministic_matrices=deterministic_matrices,
             deterministic_fingerprint=deterministic_fingerprint,
         )
         if schema_response is not None:
@@ -172,6 +179,10 @@ async def detect_document_headers(
         header_structure = apply_key_value_section_hints(
             header_structure,
             deterministic_key_value_sections,
+        )
+        header_structure = apply_matrix_section_hints(
+            header_structure,
+            deterministic_matrices,
         )
         _raise_if_header_structure_has_placeholders(header_structure)
 
@@ -194,6 +205,7 @@ async def detect_document_headers(
             "header_structure": header_structure,
             "deterministic_headers": deterministic_headers,
             "deterministic_key_value_sections": deterministic_key_value_sections,
+            "deterministic_matrices": deterministic_matrices,
             "flags": flags,
             "confidence": confidence,
         }
@@ -276,6 +288,7 @@ async def _detect_known_schema(
     document: Document,
     deterministic_headers: dict[str, list[DetectedHeader]],
     deterministic_key_value_sections: dict[str, list[DetectedKeyValueSection]],
+    deterministic_matrices: dict[str, list[DetectedMatrix]],
     deterministic_fingerprint: HeaderFingerprint | None,
 ) -> DocumentDetectionResponse | None:
     schema_match: SchemaMatch | None = None
@@ -292,6 +305,7 @@ async def _detect_known_schema(
         try:
             candidate_fingerprint = build_deterministic_header_fingerprint(
                 deterministic_headers,
+                deterministic_matrices,
             )
         except ValueError:
             return None
@@ -310,6 +324,7 @@ async def _detect_known_schema(
         "header_structure": schema_match.schema.header_structure,
         "deterministic_headers": deterministic_headers,
         "deterministic_key_value_sections": deterministic_key_value_sections,
+        "deterministic_matrices": deterministic_matrices,
         "flags": [],
         "confidence": confidence,
         "match": _format_schema_match(schema_match, candidate_fingerprint.fingerprint),
@@ -530,12 +545,28 @@ def _resolve_stored_path(stored_path: str) -> Path:
     return resolved_path
 
 
-def _detect_deterministic_headers(path: Path) -> dict[str, list[DetectedHeader]]:
+def _detect_deterministic_tabular_layout(
+    path: Path,
+) -> tuple[
+    dict[str, list[DetectedHeader]],
+    dict[str, list[DetectedMatrix]],
+]:
     try:
-        return {
-            sheet_name: _deduplicate_headers(detect_table_headers(grid))
-            for sheet_name, grid in load_sheets(path).items()
-        }
+        deterministic_headers: dict[str, list[DetectedHeader]] = {}
+        deterministic_matrices: dict[str, list[DetectedMatrix]] = {}
+
+        for sheet_name, grid in load_sheets(path).items():
+            matrices = detect_matrices(grid)
+            deterministic_matrices[sheet_name] = matrices
+            deterministic_headers[sheet_name] = _deduplicate_headers(
+                [
+                    header
+                    for header in detect_table_headers(grid)
+                    if not _header_overlaps_matrix(header, matrices)
+                ]
+            )
+
+        return deterministic_headers, deterministic_matrices
     except FileNotFoundError as error:
         raise StoredDocumentFileError(str(error)) from error
     except ValueError as error:
@@ -544,9 +575,21 @@ def _detect_deterministic_headers(path: Path) -> dict[str, list[DetectedHeader]]
 
 def _detect_deterministic_key_value_sections(
     path: Path,
+    deterministic_matrices: dict[str, list[DetectedMatrix]],
 ) -> dict[str, list[DetectedKeyValueSection]]:
     try:
-        return detect_key_value_sections(path)
+        detected_sections = detect_key_value_sections(path)
+        return {
+            sheet_name: [
+                section
+                for section in sections
+                if not _key_value_section_overlaps_matrix(
+                    section,
+                    deterministic_matrices.get(sheet_name, []),
+                )
+            ]
+            for sheet_name, sections in detected_sections.items()
+        }
     except FileNotFoundError as error:
         raise StoredDocumentFileError(str(error)) from error
     except ValueError as error:
@@ -565,11 +608,13 @@ def _build_llm_cell_map(path: Path) -> dict[str, str]:
 def _build_deterministic_layout_match_fingerprint(
     deterministic_headers: dict[str, list[DetectedHeader]],
     deterministic_key_value_sections: dict[str, list[DetectedKeyValueSection]],
+    deterministic_matrices: dict[str, list[DetectedMatrix]],
 ) -> HeaderFingerprint | None:
     try:
         return build_deterministic_layout_fingerprint(
             deterministic_headers,
             deterministic_key_value_sections,
+            deterministic_matrices,
         )
     except ValueError:
         return None
@@ -594,6 +639,44 @@ def _deduplicate_headers(headers: list[DetectedHeader]) -> list[DetectedHeader]:
         deduplicated.append(header)
 
     return deduplicated
+
+
+def _header_overlaps_matrix(
+    header: DetectedHeader,
+    matrices: list[DetectedMatrix],
+) -> bool:
+    row_index = header.get("row_index")
+    if not isinstance(row_index, int):
+        return False
+
+    return any(
+        matrix["header_row_index"] <= row_index <= matrix["data_end_row_index"]
+        for matrix in matrices
+    )
+
+
+def _key_value_section_overlaps_matrix(
+    section: DetectedKeyValueSection,
+    matrices: list[DetectedMatrix],
+) -> bool:
+    section_rows = {section["row_index"]}
+    for field in section.get("fields", []):
+        coordinate = field.get("coordinate")
+        if not isinstance(coordinate, str):
+            continue
+
+        match = re.search(r"\d+", coordinate)
+        if match is not None:
+            section_rows.add(int(match.group(0)))
+
+    return any(
+        any(
+            matrix["header_row_index"] <= row_index <= matrix["data_end_row_index"]
+            for row_index in section_rows
+        )
+        for matrix in matrices
+    )
+
 
 def apply_key_value_section_hints(
     header_structure: HeaderStructure,
@@ -736,10 +819,78 @@ def _is_placeholder_key_value_section_matched_by_hint(
 
 def _first_table_section_index(sections: list[dict[str, Any]]) -> int:
     for index, section in enumerate(sections):
-        if section.get("type") == "table":
+        if section.get("type") in ("table", "matrix"):
             return index
 
     return len(sections)
+
+
+def apply_matrix_section_hints(
+    header_structure: HeaderStructure,
+    matrices: dict[str, list[DetectedMatrix]],
+) -> HeaderStructure:
+    sheets: list[dict[str, Any]] = []
+
+    for sheet in header_structure["sheets"]:
+        sheet_matrices = matrices.get(sheet["name"], [])
+        sections = [dict(section) for section in sheet["sections"]]
+
+        for matrix in sheet_matrices:
+            matrix_section = _matrix_hint_to_layout_section(matrix)
+            matching_index = _find_matrix_section_match(sections, matrix)
+            if matching_index is None:
+                sections.append(matrix_section)
+            else:
+                sections[matching_index] = matrix_section
+
+        sheets.append({"name": sheet["name"], "sections": sections})
+
+    return {"sheets": sheets}
+
+
+def _matrix_hint_to_layout_section(matrix: DetectedMatrix) -> dict[str, Any]:
+    section: dict[str, Any] = {
+        "type": "matrix",
+        "headers": [{"name": header["name"]} for header in matrix["headers"]],
+    }
+    title = matrix.get("title")
+    if isinstance(title, str) and title.strip():
+        section["title"] = title
+
+    return section
+
+
+def _find_matrix_section_match(
+    sections: list[dict[str, Any]],
+    matrix: DetectedMatrix,
+) -> int | None:
+    normalized_title = _normalize_label(matrix.get("title") or "")
+    if normalized_title:
+        for index, section in enumerate(sections):
+            if _normalize_label(section.get("title") or "") == normalized_title:
+                return index
+
+    matrix_headers = {
+        _normalize_label(header["name"])
+        for header in matrix["headers"]
+        if _normalize_label(header["name"])
+    }
+    if len(matrix_headers) < 2:
+        return None
+
+    best_index: int | None = None
+    best_overlap = 0
+    for index, section in enumerate(sections):
+        if section.get("type") not in ("table", "matrix"):
+            continue
+
+        section_headers = _collect_header_names(section.get("headers", []))
+        overlap = len(matrix_headers & section_headers)
+        if overlap >= 2 and overlap > best_overlap:
+            best_index = index
+            best_overlap = overlap
+
+    return best_index
 
 
 def _get_llm_table_sections_by_sheet(

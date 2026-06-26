@@ -182,6 +182,7 @@ def _get_document_deterministic_fingerprint(document: Document) -> str | None:
     deterministic_key_value_sections = detected_headers.get(
         "deterministic_key_value_sections",
     )
+    deterministic_matrices = detected_headers.get("deterministic_matrices")
     if not isinstance(deterministic_headers, dict):
         return None
 
@@ -190,6 +191,9 @@ def _get_document_deterministic_fingerprint(document: Document) -> str | None:
             deterministic_headers,
             deterministic_key_value_sections
             if isinstance(deterministic_key_value_sections, dict)
+            else {},
+            deterministic_matrices
+            if isinstance(deterministic_matrices, dict)
             else {},
         ).fingerprint
     except ValueError:

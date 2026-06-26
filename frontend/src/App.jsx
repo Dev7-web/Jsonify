@@ -1033,6 +1033,9 @@ function buildApprovalPayload(schemaName, sections) {
 
               return approvedHeader;
             }),
+            ...(section.type === "matrix" && section.rowHeader
+              ? { row_header: section.rowHeader }
+              : {}),
           };
 
     return {
@@ -1227,6 +1230,7 @@ function buildSectionsFromDetection(detectedHeaders) {
         sheetName: sheet.name,
         title,
         type: section.type,
+        rowHeader: section.row_header ?? "",
         headers:
           section.type === "key_value"
             ? buildKeyValueHeaders(section.fields ?? [])

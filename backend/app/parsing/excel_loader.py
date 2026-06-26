@@ -10,6 +10,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 
 Grid = list[list[Any | None]]
+MergedRanges = dict[str, list[dict[str, int]]]
 
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 _UNSUPPORTED_STYLE_XXID_PATTERN = re.compile(rb"\sxxid=(\"[^\"]*\"|'[^']*')")
@@ -133,12 +134,29 @@ def _cleanup_temp_workbook_on_close(workbook, repaired_path: Path):
 # is only available in normal mode). Safe under the 25 MB upload limit.
 # Switch to streaming header detection if uploads grow much larger.
 def load_sheets(path: str | Path) -> dict[str, Grid]:
+    sheets, _ = load_sheets_with_merged_ranges(path)
+    return sheets
+
+
+def load_sheets_with_merged_ranges(
+    path: str | Path,
+) -> tuple[dict[str, Grid], MergedRanges]:
     workbook = _open_workbook(path, read_only=False)
 
     try:
         sheets: dict[str, Grid] = {}
+        merged_ranges_by_sheet: MergedRanges = {}
 
         for worksheet in workbook.worksheets:
+            merged_ranges_by_sheet[worksheet.title] = [
+                {
+                    "min_row": merged_range.min_row,
+                    "max_row": merged_range.max_row,
+                    "min_col": merged_range.min_col,
+                    "max_col": merged_range.max_col,
+                }
+                for merged_range in worksheet.merged_cells.ranges
+            ]
             _expand_merged_cells(worksheet)
 
             grid: Grid = []
@@ -148,6 +166,6 @@ def load_sheets(path: str | Path) -> dict[str, Grid]:
 
             sheets[worksheet.title] = grid
 
-        return sheets
+        return sheets, merged_ranges_by_sheet
     finally:
         workbook.close()

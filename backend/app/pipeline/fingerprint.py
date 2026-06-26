@@ -66,6 +66,7 @@ def collect_header_labels(header_structure: dict[str, Any]) -> frozenset[str]:
 
 def build_deterministic_header_fingerprint(
     deterministic_headers: dict[str, list[dict[str, Any]]],
+    deterministic_matrices: dict[str, list[dict[str, Any]]] | None = None,
 ) -> HeaderFingerprint:
     labels: set[str] = set()
 
@@ -77,6 +78,15 @@ def build_deterministic_header_fingerprint(
                 if isinstance(column, dict):
                     _add_label(labels, column.get("name"))
 
+    for matrices in (deterministic_matrices or {}).values():
+        for matrix in matrices:
+            _add_label(labels, matrix.get("title"))
+            _add_label(labels, matrix.get("row_header"))
+
+            for header in matrix.get("headers", []):
+                if isinstance(header, dict):
+                    _add_label(labels, header.get("name"))
+
     return _build_fingerprint_from_labels(
         labels,
         empty_message="Deterministic headers must contain at least one table title or column.",
@@ -86,6 +96,7 @@ def build_deterministic_header_fingerprint(
 def build_deterministic_layout_fingerprint(
     deterministic_headers: dict[str, list[dict[str, Any]]],
     deterministic_key_value_sections: dict[str, list[dict[str, Any]]] | None = None,
+    deterministic_matrices: dict[str, list[dict[str, Any]]] | None = None,
 ) -> HeaderFingerprint:
     labels: set[str] = set()
     key_value_rows = _key_value_rows_by_sheet(deterministic_key_value_sections or {})
@@ -116,6 +127,18 @@ def build_deterministic_layout_fingerprint(
 
             _add_stable_layout_label(labels, table.get("title"))
             labels.update(column_names)
+
+    for matrices in (deterministic_matrices or {}).values():
+        for matrix in matrices:
+            _add_stable_layout_label(labels, matrix.get("title"))
+            _add_stable_layout_label(labels, matrix.get("row_header"))
+            labels.update(
+                _stable_unique_labels(
+                    header.get("name")
+                    for header in matrix.get("headers", [])
+                    if isinstance(header, dict)
+                )
+            )
 
     return _build_fingerprint_from_labels(
         labels,
@@ -318,6 +341,8 @@ def _collect_header_labels(header_structure: dict[str, Any]) -> set[str]:
 
             for field in section.get("fields", []):
                 _add_label(labels, field)
+
+            _add_label(labels, section.get("row_header"))
 
             for header in section.get("headers", []):
                 _collect_header_node_labels(labels, header)

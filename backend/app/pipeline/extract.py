@@ -12,7 +12,8 @@ from openpyxl.utils import get_column_letter
 from app.config import BACKEND_ROOT
 from app.db import get_db
 from app.models import Document, DocumentSchema
-from app.parsing.excel_loader import Grid, load_sheets
+from app.parsing.excel_loader import Grid, MergedRanges, load_sheets_with_merged_ranges
+from app.parsing.matrix_detector import DetectedMatrix, detect_matrices
 
 
 FieldLocators = dict[str, Any]
@@ -26,7 +27,7 @@ _SYNTHETIC_SECTION_TITLE_PATTERN = re.compile(
     r".+\s+section\s+\d+\s*$",
     re.IGNORECASE,
 )
-_LOCATOR_VERSION = 6
+_LOCATOR_VERSION = 7
 _LOCATOR_TYPE = "excel"
 _MAX_SECTION_SEARCH_ROWS = 80
 _REBO_COMMENT_OUTPUT_TITLE = "REBO Comment"
@@ -112,7 +113,7 @@ async def extract_document_json(
     schema = DocumentSchema.model_validate(schema_record)
 
     workbook_path = _resolve_stored_path(document.stored_path)
-    sheets = _load_workbook_sheets(workbook_path)
+    sheets, merged_ranges_by_sheet = _load_workbook_sheets(workbook_path)
 
     locators_created = False
     field_locators = document.extraction_locators
@@ -121,6 +122,7 @@ async def extract_document_json(
             schema.header_structure,
             sheets,
             schema_id=schema.id,
+            merged_ranges_by_sheet=merged_ranges_by_sheet,
         )
         locators_created = True
 
@@ -178,6 +180,7 @@ def build_excel_field_locators(
     sheets: dict[str, Grid],
     *,
     schema_id: str | None = None,
+    merged_ranges_by_sheet: MergedRanges | None = None,
 ) -> FieldLocators:
     sheet_locators: list[dict[str, Any]] = []
 
@@ -219,6 +222,21 @@ def build_excel_field_locators(
                         section,
                         section_index=section_index,
                         section_title_rows=section_title_rows,
+                    )
+                )
+                continue
+
+            if section_type == "matrix":
+                located_sections.append(
+                    _locate_matrix_section(
+                        grid,
+                        section,
+                        section_index=section_index,
+                        section_title_rows=section_title_rows,
+                        merged_ranges=(merged_ranges_by_sheet or {}).get(
+                            sheet_name,
+                            [],
+                        ),
                     )
                 )
                 continue
@@ -278,6 +296,11 @@ def extract_excel_with_locators(
                     )
             elif kind == "table":
                 sheet_output[output_key] = _extract_table_section(
+                    grid,
+                    section_locator,
+                )
+            elif kind == "matrix":
+                sheet_output[output_key] = _extract_matrix_section(
                     grid,
                     section_locator,
                 )
@@ -607,6 +630,140 @@ def _locate_table_section(
     }
 
 
+def _locate_matrix_section(
+    grid: Grid,
+    section: dict[str, Any],
+    *,
+    section_index: int,
+    section_title_rows: dict[int, int],
+    merged_ranges: list[dict[str, int]],
+) -> dict[str, Any]:
+    title = _optional_string(section.get("title"))
+    header_specs = _table_column_specs(section.get("headers", []))
+    if not header_specs:
+        section_name = title or section_index + 1
+        raise ExtractLocatorError(f'Matrix section "{section_name}" has no headers.')
+
+    start_row, end_row = _section_search_bounds(
+        section_index,
+        section_title_rows,
+        row_count=len(grid),
+    )
+    candidates = detect_matrices(
+        grid,
+        start_row=start_row,
+        end_row=end_row,
+    )
+    candidate = _find_matrix_candidate(
+        candidates,
+        title=title,
+        expected_headers={spec["match_key"] for spec in header_specs},
+    )
+    if candidate is None:
+        raise ExtractLocatorError(
+            f'Could not locate matrix section "{title or section_index + 1}".'
+        )
+
+    headers_by_name = {
+        _normalize_label(header["name"]): header
+        for header in candidate["headers"]
+    }
+    located_columns: list[dict[str, Any]] = []
+    for header_spec in header_specs:
+        detected_header = headers_by_name.get(header_spec["match_key"])
+        if detected_header is None:
+            continue
+
+        located_columns.append(
+            {
+                "name": header_spec["output_name"],
+                "source_header": header_spec["source_name"],
+                "start_column_index": detected_header["start_column_index"],
+                "end_column_index": detected_header["end_column_index"],
+                "coordinate": detected_header["coordinate"],
+            }
+        )
+
+    if not located_columns:
+        raise ExtractLocatorError(
+            f'Could not locate any columns for matrix section "{title or section_index + 1}".'
+        )
+
+    row_header = _optional_string(section.get("row_header"))
+    return {
+        "type": "matrix",
+        "title": title,
+        "output_title": _normalize_section_title_for_output(title),
+        "section_index": section_index,
+        "header_row_index": candidate["header_row_index"],
+        "row_label_column_index": candidate["row_label_column_index"],
+        "data_start_row_index": candidate["data_start_row_index"],
+        "data_end_row_index": candidate["data_end_row_index"],
+        "columns": located_columns,
+        "merged_ranges": _matrix_merged_ranges(
+            merged_ranges,
+            candidate=candidate,
+            columns=located_columns,
+        ),
+        **({"row_header": row_header} if row_header is not None else {}),
+    }
+
+
+def _find_matrix_candidate(
+    candidates: list[DetectedMatrix],
+    *,
+    title: str | None,
+    expected_headers: set[str],
+) -> DetectedMatrix | None:
+    normalized_title = _normalize_label(title)
+    if normalized_title:
+        for candidate in candidates:
+            if _normalize_label(candidate.get("title")) == normalized_title:
+                return candidate
+
+    best_candidate: DetectedMatrix | None = None
+    best_overlap = 0
+    for candidate in candidates:
+        candidate_headers = {
+            _normalize_label(header["name"])
+            for header in candidate["headers"]
+        }
+        overlap = len(candidate_headers & expected_headers)
+        required_overlap = min(2, len(expected_headers))
+        if overlap >= required_overlap and overlap > best_overlap:
+            best_candidate = candidate
+            best_overlap = overlap
+
+    return best_candidate
+
+
+def _matrix_merged_ranges(
+    merged_ranges: list[dict[str, int]],
+    *,
+    candidate: DetectedMatrix,
+    columns: list[dict[str, Any]],
+) -> list[dict[str, int]]:
+    matrix_min_column = min(
+        _require_int(column.get("start_column_index"), "matrix column start")
+        for column in columns
+    )
+    matrix_max_column = max(
+        _require_int(column.get("end_column_index"), "matrix column end")
+        for column in columns
+    )
+    data_start_row = candidate["data_start_row_index"]
+    data_end_row = candidate["data_end_row_index"]
+
+    return [
+        dict(merged_range)
+        for merged_range in merged_ranges
+        if merged_range["min_row"] <= data_end_row
+        and merged_range["max_row"] >= data_start_row
+        and merged_range["min_col"] <= matrix_max_column
+        and merged_range["max_col"] >= matrix_min_column
+    ]
+
+
 def _collect_section_title_rows(
     grid: Grid,
     sections: list[Any],
@@ -890,6 +1047,142 @@ def _extract_table_section(
         table_output[_unique_key(table_output, key)] = value
 
     return table_output
+
+
+def _extract_matrix_section(
+    grid: Grid,
+    section_locator: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    row_label_column_index = _require_int(
+        section_locator.get("row_label_column_index"),
+        "matrix locator row_label_column_index",
+    )
+    data_start_row_index = _require_int(
+        section_locator.get("data_start_row_index"),
+        "matrix locator data_start_row_index",
+    )
+    data_end_row_index = _require_int(
+        section_locator.get("data_end_row_index"),
+        "matrix locator data_end_row_index",
+    )
+    columns = section_locator.get("columns")
+    if not isinstance(columns, list) or not columns:
+        raise ExtractLocatorError("Matrix locator must contain at least one column.")
+    merged_ranges = section_locator.get("merged_ranges", [])
+    if not isinstance(merged_ranges, list):
+        merged_ranges = []
+
+    output: dict[str, dict[str, Any]] = {}
+    row_limit = min(data_end_row_index, len(grid))
+    for row_index in range(data_start_row_index, row_limit + 1):
+        raw_label = _cell_at(grid, row_index, row_label_column_index)
+        safe_label = _json_safe_value(raw_label)
+        if safe_label is None:
+            continue
+
+        label = str(safe_label).strip()
+        if not label:
+            continue
+
+        row_key = _unique_matrix_row_key(output, label)
+        row_output: dict[str, Any] = {}
+        for column in columns:
+            name = _require_string(column.get("name"), "matrix column name")
+            start_column_index = _require_int(
+                column.get("start_column_index"),
+                "matrix column start_column_index",
+            )
+            end_column_index = _require_int(
+                column.get("end_column_index"),
+                "matrix column end_column_index",
+            )
+            row_output[name] = _matrix_range_value(
+                grid[row_index - 1],
+                row_index=row_index,
+                start_column_index=start_column_index,
+                end_column_index=end_column_index,
+                merged_ranges=merged_ranges,
+            )
+
+        output[row_key] = row_output
+
+    return output
+
+
+def _matrix_range_value(
+    row: list[Any | None],
+    *,
+    row_index: int,
+    start_column_index: int,
+    end_column_index: int,
+    merged_ranges: list[dict[str, Any]],
+) -> Any:
+    values: list[Any] = []
+    seen: set[str] = set()
+
+    for column_index in range(start_column_index, end_column_index + 1):
+        if _is_non_anchor_merged_cell(
+            row_index=row_index,
+            column_index=column_index,
+            merged_ranges=merged_ranges,
+        ):
+            continue
+
+        safe_value = _json_safe_value(_cell_at_row(row, column_index))
+        if safe_value is None:
+            continue
+
+        dedupe_key = _normalize_label(safe_value) or repr(safe_value)
+        if dedupe_key in seen:
+            continue
+
+        seen.add(dedupe_key)
+        values.append(safe_value)
+
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+
+    return " | ".join(str(value) for value in values)
+
+
+def _is_non_anchor_merged_cell(
+    *,
+    row_index: int,
+    column_index: int,
+    merged_ranges: list[dict[str, Any]],
+) -> bool:
+    for merged_range in merged_ranges:
+        try:
+            min_row = _require_int(merged_range.get("min_row"), "merged min_row")
+            max_row = _require_int(merged_range.get("max_row"), "merged max_row")
+            min_col = _require_int(merged_range.get("min_col"), "merged min_col")
+            max_col = _require_int(merged_range.get("max_col"), "merged max_col")
+        except ExtractLocatorError:
+            continue
+
+        if (
+            min_row <= row_index <= max_row
+            and min_col <= column_index <= max_col
+        ):
+            return row_index != min_row
+
+    return False
+
+
+def _unique_matrix_row_key(
+    existing: dict[str, Any],
+    preferred_key: str,
+) -> str:
+    if preferred_key not in existing:
+        return preferred_key
+
+    index = 2
+    while f"{preferred_key} {index}" in existing:
+        index += 1
+
+    return f"{preferred_key} {index}"
 
 
 def _find_label_cell(
@@ -1245,9 +1538,9 @@ def _resolve_stored_path(stored_path: str) -> Path:
     return resolved_path
 
 
-def _load_workbook_sheets(path: Path) -> dict[str, Grid]:
+def _load_workbook_sheets(path: Path) -> tuple[dict[str, Grid], MergedRanges]:
     try:
-        return load_sheets(path)
+        return load_sheets_with_merged_ranges(path)
     except FileNotFoundError as error:
         raise ExtractStoredDocumentFileError(str(error)) from error
     except ValueError as error:

@@ -9,6 +9,7 @@ from openpyxl import Workbook
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from app.models import Document, DocumentSchema
+from app.llm.header_prompt import validate_header_structure
 from app.pipeline.extract import extract_document_json, get_document_output_json
 from app.pipeline.fingerprint import build_header_structure_fingerprint
 
@@ -46,7 +47,36 @@ HEADER_STRUCTURE = {
                     "fields": [],
                 },
             ],
-        }
+        },
+        {
+            "name": "Tenant Contact",
+            "sections": [
+                {
+                    "type": "matrix",
+                    "title": "LEASE/CONTACT INFORMATION:",
+                    "headers": [
+                        {"name": "Billing Contact"},
+                        {"name": "Notice Address"},
+                        {"name": "REBO Comment"},
+                    ],
+                }
+            ],
+        },
+        {
+            "name": "Annual Matrix",
+            "sections": [
+                {
+                    "type": "matrix",
+                    "title": "Annual Charges",
+                    "row_header": "Charge Type",
+                    "headers": [
+                        {"name": "2024"},
+                        {"name": "2025"},
+                        {"name": "2026"},
+                    ],
+                }
+            ],
+        },
     ]
 }
 
@@ -160,6 +190,55 @@ def create_workbook(path: Path) -> None:
     worksheet["K2"] = "Lease ID reviewed from source document"
     worksheet["K7"] = "Rent row needs legal review"
     worksheet["K8"] = "CAM row confirmed"
+
+    contact_sheet = workbook.create_sheet("Tenant Contact")
+    contact_sheet.merge_cells("A1:O1")
+    contact_sheet["A1"] = "OCCUPANT INFORMATION (TT CONTACT INFO)"
+    contact_sheet.merge_cells("B3:D3")
+    contact_sheet["B3"] = "LEASE/CONTACT INFORMATION:"
+    contact_sheet.merge_cells("E4:G4")
+    contact_sheet["E4"] = "Billing Contact"
+    contact_sheet.merge_cells("H4:J4")
+    contact_sheet["H4"] = "Notice Address"
+    contact_sheet.merge_cells("M4:N4")
+    contact_sheet["M4"] = "REBO Comment"
+
+    contact_sheet["B5"] = "Contact Name:"
+    contact_sheet["E5"] = "{{Contact Name_subsummarization}}"
+    contact_sheet["B6"] = "Phone Number:"
+    contact_sheet["H6"] = "757-321-5000"
+    contact_sheet.merge_cells("M6:R7")
+    contact_sheet["M6"] = "1. Updated Billing contact"
+    contact_sheet["B7"] = "Fax Number:"
+    contact_sheet["H7"] = "757-321-5220"
+    contact_sheet["B8"] = "Email Address:"
+    contact_sheet["E8"] = "MS_Rents@dollartree.com"
+    contact_sheet["B9"] = "Billing Name:"
+    contact_sheet["E9"] = "Dollar Tree Stores, Inc."
+    contact_sheet["H9"] = "Dollar Tree Stores, Inc."
+    contact_sheet["B10"] = "Attention:"
+    contact_sheet["E10"] = "Lease Accounting Dept 300"
+    contact_sheet["H10"] = "Lease Administration Department"
+    contact_sheet["B11"] = "Address:"
+    contact_sheet["E11"] = "500 Volvo Parkway"
+    contact_sheet["H11"] = "500 Volvo Parkway"
+    contact_sheet["B12"] = "City State Zip:"
+    contact_sheet["E12"] = "Chesapeake, VA 23320"
+    contact_sheet["H12"] = "Chesapeake, VA 23320"
+
+    annual_sheet = workbook.create_sheet("Annual Matrix")
+    annual_sheet["A1"] = "Annual Charges"
+    annual_sheet["B2"] = "2024"
+    annual_sheet["C2"] = "2025"
+    annual_sheet["D2"] = "2026"
+    annual_sheet["A3"] = "CAM"
+    annual_sheet["B3"] = 100
+    annual_sheet["C3"] = 110
+    annual_sheet["D3"] = 120
+    annual_sheet["A4"] = "Tax"
+    annual_sheet["B4"] = 20
+    annual_sheet["C4"] = 25
+    annual_sheet["D4"] = 30
 
     workbook.save(path)
 
@@ -513,6 +592,7 @@ def create_pacific_workbook(
 async def main() -> None:
     workbook_path = UPLOADS_DIR / WORKBOOK_NAME
     create_workbook(workbook_path)
+    validate_header_structure(HEADER_STRUCTURE)
 
     schema = DocumentSchema(
         name="Dollar Tree extraction layout",
@@ -548,7 +628,7 @@ async def main() -> None:
     assert "field_locators" in fake_db.schemas.records[schema.id]
     assert fake_db.documents.records[document.id]["status"] == "extracted"
     assert fake_db.documents.records[document.id]["output_json"] == output_json
-    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 6
+    assert fake_db.documents.records[document.id]["extraction_locators"]["version"] == 7
     assert (
         fake_db.documents.records[document.id]["extraction_locators"]["schema_id"]
         == schema.id
@@ -577,6 +657,52 @@ async def main() -> None:
         "row_2": "Lease ID reviewed from source document",
         "row_7": "Rent row needs legal review",
         "row_8": "CAM row confirmed",
+    }
+    assert output_json["Tenant Contact"]["LEASE/CONTACT INFORMATION:"] == {
+        "Contact Name:": {
+            "Billing Contact": None,
+            "Notice Address": None,
+            "REBO Comment": None,
+        },
+        "Phone Number:": {
+            "Billing Contact": None,
+            "Notice Address": "757-321-5000",
+            "REBO Comment": "1. Updated Billing contact",
+        },
+        "Fax Number:": {
+            "Billing Contact": None,
+            "Notice Address": "757-321-5220",
+            "REBO Comment": None,
+        },
+        "Email Address:": {
+            "Billing Contact": "MS_Rents@dollartree.com",
+            "Notice Address": None,
+            "REBO Comment": None,
+        },
+        "Billing Name:": {
+            "Billing Contact": "Dollar Tree Stores, Inc.",
+            "Notice Address": "Dollar Tree Stores, Inc.",
+            "REBO Comment": None,
+        },
+        "Attention:": {
+            "Billing Contact": "Lease Accounting Dept 300",
+            "Notice Address": "Lease Administration Department",
+            "REBO Comment": None,
+        },
+        "Address:": {
+            "Billing Contact": "500 Volvo Parkway",
+            "Notice Address": "500 Volvo Parkway",
+            "REBO Comment": None,
+        },
+        "City State Zip:": {
+            "Billing Contact": "Chesapeake, VA 23320",
+            "Notice Address": "Chesapeake, VA 23320",
+            "REBO Comment": None,
+        },
+    }
+    assert output_json["Annual Matrix"]["Annual Charges"] == {
+        "CAM": {"2024": 100, "2025": 110, "2026": 120},
+        "Tax": {"2024": 20, "2025": 25, "2026": 30},
     }
 
     pacific_schema = DocumentSchema(
