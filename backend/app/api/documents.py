@@ -1,9 +1,14 @@
+import asyncio
+from datetime import datetime, timezone
+import json
 from pathlib import Path
+import time
 from typing import Any
 from uuid import uuid4
 
 import aiofiles
-from fastapi import APIRouter, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Response, UploadFile, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..db import get_db
@@ -17,12 +22,12 @@ from ..pipeline.approve import (
     approve_document_headers,
 )
 from ..pipeline.detect import (
-    DetectionInProgressError,
     DocumentNotFoundError,
     InvalidDocumentFileError,
     StoredDocumentFileError,
     UnsupportedDocumentTypeError,
-    detect_document_headers,
+    run_document_header_detection,
+    start_document_header_detection,
 )
 from ..pipeline.extract import (
     ExtractDocumentNotFoundError,
@@ -70,12 +75,14 @@ class DocumentResponse(BaseModel):
     file_type: FileType
     status: DocumentStatus
     detected_headers: dict[str, Any] | None = None
+    review_draft: dict[str, Any] | None = None
     output_json: dict[str, Any] | None = None
     confidence: float | None = None
     fingerprint: str | None = None
     deterministic_fingerprint: str | None = None
     matched_schema_id: str | None = None
     failure_reason: str | None = None
+    detection_progress: dict[str, Any] | None = None
 
 
 class DocumentDetectHeadersResponse(BaseModel):
@@ -89,9 +96,28 @@ class DocumentDetectHeadersResponse(BaseModel):
     matched_schema_id: str | None = None
 
 
+class DocumentDetectHeadersStartResponse(BaseModel):
+    id: str
+    status: DocumentStatus
+    message: str
+    event_url: str
+    detection_progress: dict[str, Any] | None = None
+
+
 class DocumentApproveHeadersRequest(BaseModel):
-    name: str = Field(min_length=1)
+    name: str | None = Field(default=None, min_length=1)
+    header_structure: dict[str, Any] | None = None
+
+
+class DocumentReviewDraftRequest(BaseModel):
+    schema_name: str = Field(min_length=1)
     header_structure: dict[str, Any]
+    review_state: dict[str, Any]
+
+
+class DocumentReviewDraftResponse(BaseModel):
+    id: str
+    review_draft: dict[str, Any]
 
 
 class DocumentApproveHeadersResponse(BaseModel):
@@ -115,6 +141,53 @@ class DocumentJsonResponse(BaseModel):
     id: str
     status: DocumentStatus
     output_json: dict[str, Any]
+
+
+def _format_detection_event_payload(document: Document) -> dict[str, Any]:
+    progress = document.detection_progress or {}
+    percent = progress.get("percent")
+    stage = progress.get("stage")
+    message = progress.get("message")
+
+    if not isinstance(percent, int):
+        percent = 100 if document.status in {"needs_review", "approved", "extracted"} else 0
+    if not isinstance(stage, str):
+        stage = "complete" if document.status in {"needs_review", "approved", "extracted"} else document.status
+    if not isinstance(message, str):
+        if document.status == "failed":
+            message = document.failure_reason or "Header detection failed."
+        elif document.status in {"needs_review", "approved", "extracted"}:
+            message = "Header detection complete."
+        else:
+            message = "Header detection is running."
+
+    payload: dict[str, Any] = {
+        "id": document.id,
+        "status": document.status,
+        "percent": max(0, min(100, percent)),
+        "stage": stage,
+        "message": message,
+    }
+    updated_at = progress.get("updated_at")
+    if isinstance(updated_at, str):
+        payload["updated_at"] = updated_at
+    if document.failure_reason:
+        payload["failure_reason"] = document.failure_reason
+
+    return payload
+
+
+def _detection_event_name(document_status: DocumentStatus) -> str:
+    if document_status == "failed":
+        return "failed"
+    if document_status in {"needs_review", "approved", "extracted"}:
+        return "complete"
+    return "progress"
+
+
+def _format_sse_event(event: str, data: dict[str, Any]) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
 
 
 def get_file_type(filename: str) -> FileType:
@@ -226,27 +299,31 @@ async def get_document(document_id: str) -> DocumentResponse:
         file_type=document.file_type,
         status=document.status,
         detected_headers=document.detected_headers,
+        review_draft=document.review_draft,
         output_json=document.output_json,
         confidence=document.confidence,
         fingerprint=document.fingerprint,
         deterministic_fingerprint=document.deterministic_fingerprint,
         matched_schema_id=document.matched_schema_id,
         failure_reason=document.failure_reason,
+        detection_progress=document.detection_progress,
     )
 
 
-@router.post("/{document_id}/detect-headers", response_model=DocumentDetectHeadersResponse)
-async def detect_headers(document_id: str) -> DocumentDetectHeadersResponse:
+@router.post(
+    "/{document_id}/detect-headers",
+    response_model=DocumentDetectHeadersResponse | DocumentDetectHeadersStartResponse,
+)
+async def detect_headers(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    response: Response,
+) -> DocumentDetectHeadersResponse | DocumentDetectHeadersStartResponse:
     try:
-        result = await detect_document_headers(document_id)
+        result = await start_document_header_detection(document_id)
     except DocumentNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(error),
-        ) from error
-    except DetectionInProgressError as error:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
             detail=str(error),
         ) from error
     except UnsupportedDocumentTypeError as error:
@@ -275,7 +352,106 @@ async def detect_headers(document_id: str) -> DocumentDetectHeadersResponse:
             detail=str(error),
         ) from error
 
+    if result.get("status") == "detecting":
+        if result.get("started"):
+            background_tasks.add_task(run_document_header_detection, document_id)
+
+        response.status_code = status.HTTP_202_ACCEPTED
+        return DocumentDetectHeadersStartResponse(
+            id=document_id,
+            status="detecting",
+            message=str(result.get("message") or "Header detection started."),
+            event_url=f"/documents/{document_id}/detect-headers/events",
+            detection_progress=result.get("detection_progress"),
+        )
+
     return DocumentDetectHeadersResponse(**result)
+
+
+@router.patch("/{document_id}/review-draft", response_model=DocumentReviewDraftResponse)
+async def save_review_draft(
+    document_id: str,
+    payload: DocumentReviewDraftRequest,
+) -> DocumentReviewDraftResponse:
+    review_draft = {
+        "schema_name": payload.schema_name,
+        "header_structure": payload.header_structure,
+        "review_state": payload.review_state,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    result = await get_db().documents.update_one(
+        {"_id": document_id},
+        {"$set": {"review_draft": review_draft}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document not found: {document_id}",
+        )
+
+    return DocumentReviewDraftResponse(
+        id=document_id,
+        review_draft=review_draft,
+    )
+
+
+@router.get("/{document_id}/detect-headers/events")
+async def detect_header_events(document_id: str) -> StreamingResponse:
+    record = await get_db().documents.find_one({"_id": document_id})
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document not found: {document_id}",
+        )
+
+    async def event_stream():
+        last_heartbeat_at = time.monotonic()
+        last_payload: str | None = None
+
+        while True:
+            record = await get_db().documents.find_one({"_id": document_id})
+            if record is None:
+                yield _format_sse_event(
+                    "failed",
+                    {
+                        "id": document_id,
+                        "status": "failed",
+                        "percent": 100,
+                        "stage": "failed",
+                        "message": f"Document not found: {document_id}",
+                    },
+                )
+                return
+
+            document = Document.model_validate(record)
+            payload = _format_detection_event_payload(document)
+            serialized = json.dumps(payload, separators=(",", ":"))
+
+            if serialized != last_payload:
+                yield _format_sse_event(_detection_event_name(document.status), payload)
+                last_payload = serialized
+                last_heartbeat_at = time.monotonic()
+
+            if document.status in {"needs_review", "approved", "extracted", "failed"}:
+                return
+
+            now = time.monotonic()
+            if now - last_heartbeat_at >= 15:
+                yield ": heartbeat\n\n"
+                last_heartbeat_at = now
+
+            await asyncio.sleep(3)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/{document_id}/approve-headers", response_model=DocumentApproveHeadersResponse)
@@ -283,11 +459,39 @@ async def approve_headers(
     document_id: str,
     payload: DocumentApproveHeadersRequest,
 ) -> DocumentApproveHeadersResponse:
+    schema_name = payload.name
+    header_structure = payload.header_structure
+
+    if schema_name is None or header_structure is None:
+        record = await get_db().documents.find_one({"_id": document_id})
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document not found: {document_id}",
+            )
+
+        review_draft = record.get("review_draft")
+        if isinstance(review_draft, dict):
+            if schema_name is None:
+                draft_name = review_draft.get("schema_name")
+                if isinstance(draft_name, str) and draft_name.strip():
+                    schema_name = draft_name
+            if header_structure is None:
+                draft_header_structure = review_draft.get("header_structure")
+                if isinstance(draft_header_structure, dict):
+                    header_structure = draft_header_structure
+
+    if schema_name is None or header_structure is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Approve headers requires a header structure or a saved review draft.",
+        )
+
     try:
         result = await approve_document_headers(
             document_id,
-            name=payload.name,
-            header_structure=payload.header_structure,
+            name=schema_name,
+            header_structure=header_structure,
         )
     except ApproveDocumentNotFoundError as error:
         raise HTTPException(

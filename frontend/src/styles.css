@@ -283,6 +283,35 @@ select:focus {
   margin: 0;
 }
 
+.detection-loader {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  color: #334155;
+  display: flex;
+  font-size: 14px;
+  font-weight: 800;
+  gap: 10px;
+  padding: 12px;
+}
+
+.loader-spinner {
+  animation: loader-spin 800ms linear infinite;
+  border: 3px solid #dbeafe;
+  border-top-color: #2563eb;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  height: 18px;
+  width: 18px;
+}
+
+@keyframes loader-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .review-shell {
   display: grid;
   gap: 18px;

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -63,6 +64,13 @@ class DetectionResult(TypedDict, total=False):
     match: dict[str, Any]
 
 
+class DetectionProgress(TypedDict):
+    percent: int
+    stage: str
+    message: str
+    updated_at: str
+
+
 class DocumentDetectionResponse(TypedDict, total=False):
     id: str
     status: str
@@ -72,6 +80,14 @@ class DocumentDetectionResponse(TypedDict, total=False):
     fingerprint: str
     deterministic_fingerprint: str
     matched_schema_id: str
+
+
+class DocumentDetectionStartResponse(TypedDict, total=False):
+    id: str
+    status: str
+    message: str
+    started: bool
+    detection_progress: DetectionProgress
 
 
 class DetectHeadersError(RuntimeError):
@@ -98,10 +114,96 @@ class DetectionInProgressError(DetectHeadersError):
     pass
 
 
+async def start_document_header_detection(
+    document_id: str,
+    *,
+    db: AsyncIOMotorDatabase | None = None,
+) -> DocumentDetectionResponse | DocumentDetectionStartResponse:
+    database = db if db is not None else get_db()
+    record = await database.documents.find_one({"_id": document_id})
+    if record is None:
+        raise DocumentNotFoundError(f"Document not found: {document_id}")
+
+    try:
+        document = Document.model_validate(record)
+        _ensure_xlsx_document(document)
+    except Exception as error:
+        await _mark_document_failed(database, document_id, reason=str(error))
+        raise
+
+    completed_response = _completed_detection_response(document)
+    if completed_response is not None:
+        return completed_response
+
+    if document.status == "detecting":
+        return {
+            "id": document_id,
+            "status": "detecting",
+            "message": "Header detection is already running.",
+            "started": False,
+            "detection_progress": _coerce_detection_progress(
+                document.detection_progress,
+                fallback_stage="detecting",
+                fallback_percent=5,
+                fallback_message="Header detection is already running.",
+            ),
+        }
+
+    progress = _build_detection_progress(
+        0,
+        "queued",
+        "Header detection queued.",
+    )
+    transition = await _claim_document_for_detection(
+        database,
+        document_id,
+        progress=progress,
+    )
+    if transition.matched_count == 0:
+        record = await database.documents.find_one({"_id": document_id})
+        current_progress = None
+        if record is not None:
+            current_progress = record.get("detection_progress")
+
+        return {
+            "id": document_id,
+            "status": "detecting",
+            "message": "Header detection is already running.",
+            "started": False,
+            "detection_progress": _coerce_detection_progress(
+                current_progress,
+                fallback_stage="detecting",
+                fallback_percent=5,
+                fallback_message="Header detection is already running.",
+            ),
+        }
+
+    return {
+        "id": document_id,
+        "status": "detecting",
+        "message": "Header detection started.",
+        "started": True,
+        "detection_progress": progress,
+    }
+
+
+async def run_document_header_detection(
+    document_id: str,
+    *,
+    db: AsyncIOMotorDatabase | None = None,
+) -> None:
+    try:
+        await detect_document_headers(document_id, db=db, claim=False)
+    except Exception:
+        # detect_document_headers persists the failure reason before raising.
+        return
+
+
 async def detect_document_headers(
     document_id: str,
     *,
     db: AsyncIOMotorDatabase | None = None,
+    claim: bool = True,
 ) -> DocumentDetectionResponse:
     database = db if db is not None else get_db()
     record = await database.documents.find_one({"_id": document_id})
@@ -117,30 +219,40 @@ async def detect_document_headers(
         await _mark_document_failed(database, document_id, reason=str(error))
         raise
 
-    # Atomic status transition: the conditional `$ne: "detecting"` makes this
-    # the lock. A second concurrent caller sees matched_count == 0 and bails
-    # out with DetectionInProgressError — no duplicate LLM call.
-    transition = await database.documents.update_one(
-        {"_id": document_id, "status": {"$ne": "detecting"}},
-        {
-            "$set": {"status": "detecting"},
-            "$unset": {
-                "detected_headers": "",
-                "confidence": "",
-                "fingerprint": "",
-                "matched_schema_id": "",
-                "pii_document_id": "",
-                "failure_reason": "",
-            },
-        },
-    )
-    if transition.matched_count == 0:
-        raise DetectionInProgressError(
-            f"Detection is already running for document {document_id}."
+    if claim:
+        # Atomic status transition: the conditional `$ne: "detecting"` makes this
+        # the lock. A second concurrent caller sees matched_count == 0 and bails
+        # out with DetectionInProgressError — no duplicate LLM call.
+        transition = await _claim_document_for_detection(
+            database,
+            document_id,
+            progress=_build_detection_progress(
+                0,
+                "queued",
+                "Header detection queued.",
+            ),
         )
+        if transition.matched_count == 0:
+            raise DetectionInProgressError(
+                f"Detection is already running for document {document_id}."
+            )
 
     try:
+        await _set_detection_progress(
+            database,
+            document_id,
+            percent=5,
+            stage="validating",
+            message="Validating document.",
+        )
         workbook_path = _resolve_stored_path(document.stored_path)
+        await _set_detection_progress(
+            database,
+            document_id,
+            percent=15,
+            stage="pre_scan",
+            message="Running deterministic Excel pre-scan.",
+        )
         deterministic_headers, deterministic_matrices = (
             _detect_deterministic_tabular_layout(workbook_path)
         )
@@ -153,6 +265,13 @@ async def detect_document_headers(
             deterministic_key_value_sections,
             deterministic_matrices,
         )
+        await _set_detection_progress(
+            database,
+            document_id,
+            percent=30,
+            stage="schema_matching",
+            message="Checking for a matching saved schema.",
+        )
 
         schema_response = await _detect_known_schema(
             database,
@@ -163,15 +282,43 @@ async def detect_document_headers(
             deterministic_fingerprint=deterministic_fingerprint,
         )
         if schema_response is not None:
+            await _set_detection_progress(
+                database,
+                document_id,
+                percent=100,
+                stage="complete",
+                message="Header detection complete.",
+            )
             return schema_response
 
         pii_document_ids: list[str] = []
+        await _set_detection_progress(
+            database,
+            document_id,
+            percent=45,
+            stage="preparing_workbook_text",
+            message="Preparing workbook text for header detection.",
+        )
         cell_map = _build_llm_cell_map(workbook_path)
+        await _set_detection_progress(
+            database,
+            document_id,
+            percent=65,
+            stage="llm",
+            message="Running LLM header detection.",
+        )
         header_structure = await adetect_header_structure_from_cell_map(
             cell_map,
             pii_document_id_callback=pii_document_ids.append,
         )
         pii_document_id = pii_document_ids[-1] if pii_document_ids else None
+        await _set_detection_progress(
+            database,
+            document_id,
+            percent=80,
+            stage="validating_headers",
+            message="Restoring placeholders and validating detected headers.",
+        )
         header_structure = await _restore_header_structure_placeholders(
             header_structure,
             pii_document_id,
@@ -234,12 +381,24 @@ async def detect_document_headers(
             unset_fields["deterministic_fingerprint"] = ""
 
         unset_fields["matched_schema_id"] = ""
+        update_fields["detection_progress"] = _build_detection_progress(
+            95,
+            "saving_result",
+            "Saving detected headers.",
+        )
 
         update: dict[str, Any] = {"$set": update_fields}
         if unset_fields:
             update["$unset"] = unset_fields
 
         await database.documents.update_one({"_id": document_id}, update)
+        await _set_detection_progress(
+            database,
+            document_id,
+            percent=100,
+            stage="complete",
+            message="Header detection complete.",
+        )
 
         return {
             "id": document_id,
@@ -994,6 +1153,135 @@ def _ratio(numerator: int, denominator: int) -> float:
     return min(1.0, numerator / denominator)
 
 
+async def _claim_document_for_detection(
+    db: AsyncIOMotorDatabase,
+    document_id: str,
+    *,
+    progress: DetectionProgress,
+) -> Any:
+    return await db.documents.update_one(
+        {"_id": document_id, "status": {"$ne": "detecting"}},
+        {
+            "$set": {
+                "status": "detecting",
+                "detection_progress": progress,
+            },
+            "$unset": {
+                "detected_headers": "",
+                "review_draft": "",
+                "confidence": "",
+                "fingerprint": "",
+                "deterministic_fingerprint": "",
+                "matched_schema_id": "",
+                "pii_document_id": "",
+                "failure_reason": "",
+            },
+        },
+    )
+
+
+async def _set_detection_progress(
+    db: AsyncIOMotorDatabase,
+    document_id: str,
+    *,
+    percent: int,
+    stage: str,
+    message: str,
+) -> None:
+    await db.documents.update_one(
+        {"_id": document_id},
+        {
+            "$set": {
+                "detection_progress": _build_detection_progress(
+                    percent,
+                    stage,
+                    message,
+                )
+            }
+        },
+    )
+
+
+def _build_detection_progress(
+    percent: int,
+    stage: str,
+    message: str,
+) -> DetectionProgress:
+    return {
+        "percent": max(0, min(100, percent)),
+        "stage": stage,
+        "message": message,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _coerce_detection_progress(
+    value: Any,
+    *,
+    fallback_stage: str,
+    fallback_percent: int,
+    fallback_message: str,
+) -> DetectionProgress:
+    if isinstance(value, dict):
+        percent = value.get("percent")
+        stage = value.get("stage")
+        message = value.get("message")
+        updated_at = value.get("updated_at")
+        if (
+            isinstance(percent, int)
+            and isinstance(stage, str)
+            and isinstance(message, str)
+            and isinstance(updated_at, str)
+        ):
+            return {
+                "percent": max(0, min(100, percent)),
+                "stage": stage,
+                "message": message,
+                "updated_at": updated_at,
+            }
+
+    return _build_detection_progress(
+        fallback_percent,
+        fallback_stage,
+        fallback_message,
+    )
+
+
+def _completed_detection_response(
+    document: Document,
+) -> DocumentDetectionResponse | None:
+    if document.status not in ("needs_review", "approved", "extracted"):
+        return None
+
+    detected_headers = document.detected_headers
+    if not isinstance(detected_headers, dict):
+        return None
+
+    source = detected_headers.get("source") or (
+        "schema" if document.matched_schema_id else "llm"
+    )
+    confidence = document.confidence
+    if confidence is None:
+        detected_confidence = detected_headers.get("confidence")
+        confidence = detected_confidence if isinstance(detected_confidence, (int, float)) else 0.0
+
+    response: DocumentDetectionResponse = {
+        "id": document.id,
+        "status": document.status,
+        "source": source,
+        "confidence": float(confidence),
+        "detected_headers": detected_headers,
+    }
+    if document.fingerprint is not None:
+        response["fingerprint"] = document.fingerprint
+    if document.deterministic_fingerprint is not None:
+        response["deterministic_fingerprint"] = document.deterministic_fingerprint
+    if document.matched_schema_id is not None:
+        response["matched_schema_id"] = document.matched_schema_id
+
+    return response
+
+
 def _format_missing_table_message(sheet_name: str, title: str | None) -> str:
     table_title = title or "Untitled table"
     return (
@@ -1019,10 +1307,19 @@ async def _mark_document_failed(
     await db.documents.update_one(
         {"_id": document_id},
         {
-            "$set": {"status": "failed", "failure_reason": reason},
+            "$set": {
+                "status": "failed",
+                "failure_reason": reason,
+                "detection_progress": _build_detection_progress(
+                    100,
+                    "failed",
+                    reason,
+                ),
+            },
             "$unset": {
                 "confidence": "",
                 "fingerprint": "",
+                "deterministic_fingerprint": "",
                 "matched_schema_id": "",
             },
         },

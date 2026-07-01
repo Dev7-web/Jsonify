@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -107,13 +108,35 @@ async def main() -> None:
             "]}]}"
         )
 
+    async def fake_pii_redact(payload: Any) -> tuple[str, Any]:
+        redacted = {
+            key: (
+                "<PERSON_1234>"
+                if value == "Neha Rao"
+                else "<EMAIL_1234>"
+                if value == "neha@acme.in"
+                else value
+            )
+            for key, value in payload.items()
+        }
+        return "pii-doc-smoke", redacted
+
     original_gemini = llm_client.gemini_call
+    original_pii_redact = llm_client.pii_redact
+    original_pii_enabled = os.environ.get("PII_ENABLED")
+    os.environ["PII_ENABLED"] = "true"
     llm_client.gemini_call = fake_gemini
+    llm_client.pii_redact = fake_pii_redact
 
     try:
         result = await detect_document_headers(document.id, db=fake_db)
     finally:
         llm_client.gemini_call = original_gemini
+        llm_client.pii_redact = original_pii_redact
+        if original_pii_enabled is None:
+            os.environ.pop("PII_ENABLED", None)
+        else:
+            os.environ["PII_ENABLED"] = original_pii_enabled
         workbook_path.unlink(missing_ok=True)
 
     stored_document = fake_db.documents.records[document.id]

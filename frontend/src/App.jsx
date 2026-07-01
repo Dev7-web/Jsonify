@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import {
   approveDocumentHeaders,
+  createDetectionEventSource,
   detectDocumentHeaders,
   extractDocumentJson,
   getDocument,
   getDocumentJson,
   getHealth,
+  saveDocumentReviewDraft,
   uploadDocument,
 } from "./api";
 import HeaderEditor from "./components/HeaderEditor";
@@ -16,9 +19,27 @@ import StatusChip from "./components/StatusChip";
 import "./styles.css";
 
 const DEFAULT_SCHEMA_NAME = "New layout schema";
-const DOCUMENT_REVIEW_PATH_PATTERN = /^\/documents\/([^/]+)\/review\/?$/;
+const DRAFT_AUTOSAVE_DELAY_MS = 700;
+const DETECTION_POLL_INTERVAL_MS = 3000;
+const DETECTION_TERMINAL_STATUSES = new Set([
+  "needs_review",
+  "approved",
+  "extracted",
+]);
 
 export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<DocumentWorkflow />} />
+      <Route path="/documents/:documentId/review" element={<DocumentWorkflow />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  );
+}
+
+function DocumentWorkflow() {
+  const { documentId: routeDocumentId = "" } = useParams();
+  const navigate = useNavigate();
   const [backendStatus, setBackendStatus] = useState("checking");
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploadResult, setUploadResult] = useState(null);
@@ -41,6 +62,10 @@ export default function App() {
   const [sections, setSections] = useState([]);
   const [selectedSectionId, setSelectedSectionId] = useState("");
   const [selectedHeaderId, setSelectedHeaderId] = useState("");
+  const [detectionProgress, setDetectionProgress] = useState(null);
+  const detectionEventSourceRef = useRef(null);
+  const detectionPollTimerRef = useRef(null);
+  const draftSaveTimerRef = useRef(null);
 
   useEffect(() => {
     let isMounted = true;
@@ -62,6 +87,13 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    return () => {
+      stopDetectionWatch();
+      clearDraftSaveTimer();
+    };
+  }, []);
+
   const activeDocument = useMemo(() => {
     return {
       id: uploadResult?.id ?? "",
@@ -78,12 +110,13 @@ export default function App() {
   useEffect(() => {
     let isMounted = true;
 
-    async function syncDocumentFromUrl() {
-      const documentId = getDocumentIdFromUrl();
-      if (!documentId) {
+    async function syncDocumentFromRoute() {
+      if (!routeDocumentId) {
         if (isMounted) {
           setIsReviewLoaded(false);
           setRestoreError("");
+          setIsRestoringDocument(false);
+          stopDetectionWatch();
         }
         return;
       }
@@ -92,7 +125,7 @@ export default function App() {
       setRestoreError("");
 
       try {
-        const document = await getDocument(documentId);
+        const document = await getDocument(routeDocumentId);
         if (isMounted) {
           hydrateStoredDocument(document);
         }
@@ -107,14 +140,12 @@ export default function App() {
       }
     }
 
-    syncDocumentFromUrl();
-    window.addEventListener("popstate", syncDocumentFromUrl);
+    syncDocumentFromRoute();
 
     return () => {
       isMounted = false;
-      window.removeEventListener("popstate", syncDocumentFromUrl);
     };
-  }, []);
+  }, [routeDocumentId]);
 
   const selectedSection = sections.find((section) => section.id === selectedSectionId);
   const selectedHeader = selectedSection?.headers.find(
@@ -125,6 +156,41 @@ export default function App() {
     () => buildApprovalPayload(schemaName, sections),
     [schemaName, sections],
   );
+  const reviewDraftPayload = useMemo(() => {
+    if (!isReviewLoaded || !uploadResult?.id || sections.length === 0) {
+      return null;
+    }
+
+    return {
+      schema_name: schemaName.trim() || DEFAULT_SCHEMA_NAME,
+      header_structure: approvalPayload.header_structure,
+      review_state: {
+        sections,
+      },
+    };
+  }, [approvalPayload, isReviewLoaded, schemaName, sections, uploadResult?.id]);
+
+  useEffect(() => {
+    clearDraftSaveTimer();
+
+    if (
+      !reviewDraftPayload ||
+      !uploadResult?.id ||
+      activeDocument.status !== "needs_review"
+    ) {
+      return;
+    }
+
+    draftSaveTimerRef.current = window.setTimeout(() => {
+      saveDocumentReviewDraft(uploadResult.id, reviewDraftPayload).catch((error) => {
+        setRestoreError(error.message);
+      });
+    }, DRAFT_AUTOSAVE_DELAY_MS);
+
+    return () => {
+      clearDraftSaveTimer();
+    };
+  }, [activeDocument.status, reviewDraftPayload, uploadResult?.id]);
 
   async function handleUpload(event) {
     event.preventDefault();
@@ -140,9 +206,10 @@ export default function App() {
     try {
       const result = await uploadDocument(selectedFile);
       setUploadResult(result);
-      setDocumentReviewUrl(result.id);
+      navigate(getDocumentReviewPath(result.id));
       setDetectionError("");
       setDetectionResult(null);
+      setDetectionProgress(null);
       setApprovalError("");
       setApprovalResult(null);
       setExtractionError("");
@@ -171,43 +238,203 @@ export default function App() {
     }
 
     setIsDetecting(true);
+    setDetectionProgress({
+      percent: 0,
+      stage: "queued",
+      message: "Header detection queued.",
+    });
     setDetectionError("");
     setExtractionError("");
     setExtractionResult(null);
 
     try {
       const result = await detectDocumentHeaders(uploadResult.id);
-      setDocumentReviewUrl(uploadResult.id);
-      setDetectionResult(result);
+      navigate(getDocumentReviewPath(uploadResult.id));
       setApprovalError("");
       setApprovalResult(null);
       setUploadResult((currentResult) =>
         currentResult ? { ...currentResult, status: result.status } : currentResult,
       );
 
-      if (result.source === "schema") {
-        setApprovalResult({
-          status: result.status,
-          schema_id: result.matched_schema_id,
-          matched_schema_id: result.matched_schema_id,
-          fingerprint: result.fingerprint,
-        });
-        setSections([]);
-        setSelectedSectionId("");
-        setSelectedHeaderId("");
-        setIsReviewLoaded(false);
+      if (result.status === "detecting") {
+        setDetectionProgress(
+          result.detection_progress ?? {
+            percent: 0,
+            stage: "detecting",
+            message: "Header detection is running.",
+          },
+        );
+        const completedDocument = await waitForDetectionCompletion(
+          uploadResult.id,
+          result.event_url,
+        );
+        applyCompletedDetectionDocument(completedDocument);
         return;
       }
 
-      const nextSections = buildSectionsFromDetection(result.detected_headers);
-      setSections(nextSections);
-      setSelectedSectionId(nextSections[0]?.id ?? "");
-      setSelectedHeaderId(nextSections[0]?.headers[0]?.id ?? "");
-      setIsReviewLoaded(true);
+      applyCompletedDetectionResult(result);
     } catch (error) {
       setDetectionError(error.message);
     } finally {
+      stopDetectionWatch();
       setIsDetecting(false);
+    }
+  }
+
+  function applyCompletedDetectionResult(result) {
+    setDetectionResult(result);
+    setDetectionProgress(null);
+    setUploadResult((currentResult) =>
+      currentResult ? { ...currentResult, status: result.status } : currentResult,
+    );
+
+    if (result.source === "schema") {
+      setApprovalResult({
+        status: result.status,
+        schema_id: result.matched_schema_id,
+        matched_schema_id: result.matched_schema_id,
+        fingerprint: result.fingerprint,
+      });
+      setSections([]);
+      setSelectedSectionId("");
+      setSelectedHeaderId("");
+      setIsReviewLoaded(false);
+      return;
+    }
+
+    const nextSections = buildSectionsFromDetection(result.detected_headers);
+    setSections(nextSections);
+    setSelectedSectionId(nextSections[0]?.id ?? "");
+    setSelectedHeaderId(nextSections[0]?.headers[0]?.id ?? "");
+    setIsReviewLoaded(true);
+  }
+
+  function applyCompletedDetectionDocument(document) {
+    if (document.status === "failed") {
+      throw new Error(document.failure_reason || "Header detection failed.");
+    }
+
+    const storedDetectionResult = buildDetectionResultFromDocument(document);
+    if (!storedDetectionResult) {
+      throw new Error("Header detection finished without detected headers.");
+    }
+
+    setUploadResult(buildUploadResultFromDocument(document));
+    applyCompletedDetectionResult(storedDetectionResult);
+  }
+
+  function waitForDetectionCompletion(documentId, eventUrl) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const settle = (callback, value) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        stopDetectionWatch();
+        callback(value);
+      };
+
+      const resolveFromDocument = async () => {
+        try {
+          const document = await getDocument(documentId);
+          if (document.detection_progress) {
+            setDetectionProgress(document.detection_progress);
+          }
+
+          if (document.status === "failed") {
+            settle(
+              reject,
+              new Error(document.failure_reason || "Header detection failed."),
+            );
+            return true;
+          }
+
+          if (DETECTION_TERMINAL_STATUSES.has(document.status)) {
+            settle(resolve, document);
+            return true;
+          }
+
+          return false;
+        } catch (error) {
+          settle(reject, error);
+          return true;
+        }
+      };
+
+      const startPolling = () => {
+        if (settled) {
+          return;
+        }
+
+        if (detectionPollTimerRef.current) {
+          return;
+        }
+
+        detectionPollTimerRef.current = window.setInterval(() => {
+          resolveFromDocument();
+        }, DETECTION_POLL_INTERVAL_MS);
+        resolveFromDocument();
+      };
+
+      if (eventUrl && typeof EventSource !== "undefined") {
+        try {
+          const eventSource = createDetectionEventSource(eventUrl);
+          detectionEventSourceRef.current = eventSource;
+
+          eventSource.addEventListener("progress", (event) => {
+            setDetectionProgress(parseDetectionEventData(event.data));
+          });
+          eventSource.addEventListener("complete", (event) => {
+            setDetectionProgress(parseDetectionEventData(event.data));
+            resolveFromDocument();
+          });
+          eventSource.addEventListener("failed", (event) => {
+            const data = parseDetectionEventData(event.data);
+            setDetectionProgress(data);
+            settle(
+              reject,
+              new Error(data.failure_reason || data.message || "Header detection failed."),
+            );
+          });
+          eventSource.onerror = () => {
+            if (settled) {
+              return;
+            }
+
+            if (detectionEventSourceRef.current) {
+              detectionEventSourceRef.current.close();
+              detectionEventSourceRef.current = null;
+            }
+            startPolling();
+          };
+        } catch {
+          startPolling();
+        }
+      } else {
+        startPolling();
+      }
+    });
+  }
+
+  function stopDetectionWatch() {
+    if (detectionEventSourceRef.current) {
+      detectionEventSourceRef.current.close();
+      detectionEventSourceRef.current = null;
+    }
+
+    if (detectionPollTimerRef.current) {
+      window.clearInterval(detectionPollTimerRef.current);
+      detectionPollTimerRef.current = null;
+    }
+  }
+
+  function clearDraftSaveTimer() {
+    if (draftSaveTimerRef.current) {
+      window.clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
     }
   }
 
@@ -327,8 +554,9 @@ export default function App() {
     const storedExtractionResult = buildExtractionResultFromDocument(document);
     const storedApprovalResult = buildApprovalResultFromDocument(document);
     const shouldShowReview = shouldRestoreReviewScreen(document, storedDetectionResult);
+    const storedDraft = buildReviewDraftFromDocument(document);
     const restoredSections = shouldShowReview
-      ? buildSectionsFromDetection(storedDetectionResult.detected_headers)
+      ? (storedDraft?.sections ?? buildSectionsFromDetection(storedDetectionResult.detected_headers))
       : [];
 
     setSelectedFile(null);
@@ -340,11 +568,30 @@ export default function App() {
     setApprovalResult(storedApprovalResult);
     setExtractionError("");
     setExtractionResult(storedExtractionResult);
-    setSchemaName(getDefaultSchemaName(document.filename));
+    setSchemaName(storedDraft?.schemaName ?? getDefaultSchemaName(document.filename));
     setSections(restoredSections);
     setSelectedSectionId(restoredSections[0]?.id ?? "");
     setSelectedHeaderId(restoredSections[0]?.headers[0]?.id ?? "");
     setIsReviewLoaded(shouldShowReview && restoredSections.length > 0);
+
+    if (document.status === "detecting") {
+      setIsDetecting(true);
+      setDetectionProgress(document.detection_progress ?? null);
+      waitForDetectionCompletion(
+        document.id,
+        getDetectionEventUrl(document.id),
+      )
+        .then((completedDocument) => {
+          applyCompletedDetectionDocument(completedDocument);
+        })
+        .catch((error) => {
+          setDetectionError(error.message);
+        })
+        .finally(() => {
+          stopDetectionWatch();
+          setIsDetecting(false);
+        });
+    }
   }
 
   function clearSavedApproval() {
@@ -522,16 +769,19 @@ export default function App() {
           backendStatus={backendStatus}
           isUploading={isUploading}
           detectionError={detectionError}
+          detectionProgress={detectionProgress}
           isDetecting={isDetecting}
           restoreError={restoreError}
           onLoadReview={loadReview}
           onSelectedFileChange={(file) => {
             setSelectedFile(file);
-            clearDocumentReviewUrl();
+            navigate("/");
             setUploadError("");
             setUploadResult(null);
             setDetectionError("");
             setDetectionResult(null);
+            setDetectionProgress(null);
+            stopDetectionWatch();
             setApprovalError("");
             setApprovalResult(null);
             setRestoreError("");
@@ -572,7 +822,7 @@ export default function App() {
           onAddSection={addSection}
           onApprove={approveHeaders}
           onBack={() => {
-            clearDocumentReviewUrl();
+            navigate("/");
             setIsReviewLoaded(false);
           }}
           onDownloadJson={downloadJson}
@@ -610,6 +860,7 @@ function UploadAndLoadReview({
   extractionResult,
   isUploading,
   detectionError,
+  detectionProgress,
   isDetecting,
   restoreError,
   isDownloadingJson,
@@ -689,6 +940,9 @@ function UploadAndLoadReview({
         >
           {isDetecting ? "Detecting headers..." : "Load detected headers"}
         </button>
+        {isDetecting && detectionProgress ? (
+          <DetectionProgress progress={detectionProgress} />
+        ) : null}
       </div>
 
       {uploadResult && (canExtractDocument(document) || extractionResult) ? (
@@ -703,6 +957,15 @@ function UploadAndLoadReview({
         />
       ) : null}
     </section>
+  );
+}
+
+function DetectionProgress() {
+  return (
+    <div className="detection-loader" aria-live="polite" role="status">
+      <span className="loader-spinner" aria-hidden="true" />
+      <span>Detecting headers...</span>
+    </div>
   );
 }
 
@@ -1186,6 +1449,23 @@ function buildExtractionResultFromDocument(document) {
   };
 }
 
+function buildReviewDraftFromDocument(document) {
+  const draft = document.review_draft;
+  const sections = draft?.review_state?.sections;
+  const schemaName = draft?.schema_name;
+
+  if (!Array.isArray(sections)) {
+    return null;
+  }
+
+  return {
+    schemaName: typeof schemaName === "string" && schemaName.trim()
+      ? schemaName
+      : getDefaultSchemaName(document.filename),
+    sections,
+  };
+}
+
 function shouldRestoreReviewScreen(document, detectionResult) {
   return (
     document.status === "needs_review" &&
@@ -1194,25 +1474,23 @@ function shouldRestoreReviewScreen(document, detectionResult) {
   );
 }
 
-function getDocumentIdFromUrl() {
-  const match = window.location.pathname.match(DOCUMENT_REVIEW_PATH_PATTERN);
-  return match ? decodeURIComponent(match[1]) : "";
+function getDocumentReviewPath(documentId) {
+  return `/documents/${encodeURIComponent(documentId)}/review`;
 }
 
-function setDocumentReviewUrl(documentId) {
-  if (!documentId) {
-    return;
-  }
-
-  const nextPath = `/documents/${encodeURIComponent(documentId)}/review`;
-  if (window.location.pathname !== nextPath) {
-    window.history.pushState(null, "", nextPath);
-  }
+function getDetectionEventUrl(documentId) {
+  return `/documents/${encodeURIComponent(documentId)}/detect-headers/events`;
 }
 
-function clearDocumentReviewUrl() {
-  if (getDocumentIdFromUrl()) {
-    window.history.pushState(null, "", "/");
+function parseDetectionEventData(rawData) {
+  try {
+    return JSON.parse(rawData);
+  } catch {
+    return {
+      percent: 0,
+      stage: "unknown",
+      message: "Waiting for detection status...",
+    };
   }
 }
 
