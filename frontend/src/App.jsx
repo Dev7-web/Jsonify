@@ -10,6 +10,10 @@ import {
   getHealth,
   saveDocumentReviewDraft,
   uploadDocument,
+  uploadSupportingFile,
+  deleteSupportingFile,
+  runVerification,
+  getVerificationReport,
 } from "./api";
 import HeaderEditor from "./components/HeaderEditor";
 import HeaderRow from "./components/HeaderRow";
@@ -17,6 +21,7 @@ import SchemaNamePanel from "./components/SchemaNamePanel";
 import SectionList from "./components/SectionList";
 import StatusChip from "./components/StatusChip";
 import "./styles.css";
+
 
 const DEFAULT_SCHEMA_NAME = "New layout schema";
 const DRAFT_AUTOSAVE_DELAY_MS = 700;
@@ -42,6 +47,7 @@ function DocumentWorkflow() {
   const navigate = useNavigate();
   const [backendStatus, setBackendStatus] = useState("checking");
   const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedSupportingFiles, setSelectedSupportingFiles] = useState([]);
   const [uploadResult, setUploadResult] = useState(null);
   const [uploadError, setUploadError] = useState("");
   const [isUploading, setIsUploading] = useState(false);
@@ -63,6 +69,12 @@ function DocumentWorkflow() {
   const [selectedSectionId, setSelectedSectionId] = useState("");
   const [selectedHeaderId, setSelectedHeaderId] = useState("");
   const [detectionProgress, setDetectionProgress] = useState(null);
+  const [supportingFiles, setSupportingFiles] = useState([]);
+  const [isUploadingSupporting, setIsUploadingSupporting] = useState(false);
+  const [supportingUploadError, setSupportingUploadError] = useState("");
+  const [verificationReport, setVerificationReport] = useState(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verificationError, setVerificationError] = useState("");
   const detectionEventSourceRef = useRef(null);
   const detectionPollTimerRef = useRef(null);
   const draftSaveTimerRef = useRef(null);
@@ -202,23 +214,29 @@ function DocumentWorkflow() {
     setIsUploading(true);
     setUploadError("");
     setUploadResult(null);
+    setDetectionError("");
+    setDetectionResult(null);
+    setDetectionProgress(null);
+    setApprovalError("");
+    setApprovalResult(null);
+    setExtractionError("");
+    setExtractionResult(null);
+    setSchemaName(getDefaultSchemaName(selectedFile.name));
+    setSections([]);
+    setSelectedSectionId("");
+    setSelectedHeaderId("");
+    setIsReviewLoaded(false);
+    setSupportingFiles([]);
+    setSupportingUploadError("");
+    setVerificationReport(null);
+    setVerificationError("");
 
     try {
-      const result = await uploadDocument(selectedFile);
+      const result = await uploadDocument(selectedFile, selectedSupportingFiles);
       setUploadResult(result);
       navigate(getDocumentReviewPath(result.id));
-      setDetectionError("");
-      setDetectionResult(null);
-      setDetectionProgress(null);
-      setApprovalError("");
-      setApprovalResult(null);
-      setExtractionError("");
-      setExtractionResult(null);
-      setSchemaName(getDefaultSchemaName(selectedFile.name));
-      setSections([]);
-      setSelectedSectionId("");
-      setSelectedHeaderId("");
-      setIsReviewLoaded(false);
+      
+      await loadReview(result.id, result.file_type);
     } catch (error) {
       setUploadError(error.message);
     } finally {
@@ -226,13 +244,63 @@ function DocumentWorkflow() {
     }
   }
 
-  async function loadReview() {
-    if (!uploadResult) {
+  async function handleSupportingUpload(event) {
+    const file = event.target.files?.[0];
+    if (!file || !uploadResult?.id) return;
+
+    setIsUploadingSupporting(true);
+    setSupportingUploadError("");
+
+    try {
+      const updatedFiles = await uploadSupportingFile(uploadResult.id, file);
+      setSupportingFiles(updatedFiles);
+    } catch (error) {
+      setSupportingUploadError(error.message);
+    } finally {
+      setIsUploadingSupporting(false);
+      event.target.value = "";
+    }
+  }
+
+  async function handleSupportingDelete(fileId) {
+    if (!uploadResult?.id) return;
+
+    try {
+      const updatedFiles = await deleteSupportingFile(uploadResult.id, fileId);
+      setSupportingFiles(updatedFiles);
+    } catch (error) {
+      setSupportingUploadError(error.message);
+    }
+  }
+
+  async function handleVerify() {
+    if (!uploadResult?.id) return;
+
+    setIsVerifying(true);
+    setVerificationError("");
+
+    try {
+      const response = await runVerification(uploadResult.id);
+      setVerificationReport(response.verification_report);
+      setUploadResult((curr) => (curr ? { ...curr, status: response.status } : curr));
+    } catch (error) {
+      setVerificationError(error.message);
+    } finally {
+      setIsVerifying(false);
+    }
+  }
+
+
+  async function loadReview(overrideId, overrideFileType) {
+    const docId = overrideId || uploadResult?.id;
+    const fileType = overrideFileType || uploadResult?.file_type;
+    
+    if (!docId) {
       setDetectionError("Upload an .xlsx document before loading detected headers.");
       return;
     }
 
-    if (uploadResult.file_type !== "xlsx") {
+    if (fileType !== "xlsx") {
       setDetectionError("Header review is currently wired for .xlsx documents only.");
       return;
     }
@@ -248,8 +316,8 @@ function DocumentWorkflow() {
     setExtractionResult(null);
 
     try {
-      const result = await detectDocumentHeaders(uploadResult.id);
-      navigate(getDocumentReviewPath(uploadResult.id));
+      const result = await detectDocumentHeaders(docId);
+      navigate(getDocumentReviewPath(docId));
       setApprovalError("");
       setApprovalResult(null);
       setUploadResult((currentResult) =>
@@ -265,7 +333,7 @@ function DocumentWorkflow() {
           },
         );
         const completedDocument = await waitForDetectionCompletion(
-          uploadResult.id,
+          docId,
           result.event_url,
         );
         applyCompletedDetectionDocument(completedDocument);
@@ -299,6 +367,13 @@ function DocumentWorkflow() {
       setSelectedSectionId("");
       setSelectedHeaderId("");
       setIsReviewLoaded(false);
+      
+      extractJson(result.id);
+      
+      getDocument(result.id).then((doc) => {
+        setSupportingFiles(doc.supporting_files ?? []);
+      }).catch(console.error);
+      
       return;
     }
 
@@ -493,13 +568,14 @@ function DocumentWorkflow() {
     }
   }
 
-  async function extractJson() {
-    if (!uploadResult) {
+  async function extractJson(overrideId = null) {
+    const targetId = typeof overrideId === "string" ? overrideId : uploadResult?.id;
+    if (!targetId) {
       setExtractionError("Upload and approve an .xlsx document before extraction.");
       return;
     }
 
-    if (!canExtractDocument(activeDocument)) {
+    if (!overrideId && !canExtractDocument(activeDocument)) {
       setExtractionError("Approve headers before extracting the final JSON.");
       return;
     }
@@ -508,7 +584,7 @@ function DocumentWorkflow() {
     setExtractionError("");
 
     try {
-      const result = await extractDocumentJson(uploadResult.id);
+      const result = await extractDocumentJson(targetId);
       setExtractionResult(result);
       setUploadResult((currentResult) =>
         currentResult ? { ...currentResult, status: result.status } : currentResult,
@@ -573,6 +649,8 @@ function DocumentWorkflow() {
     setSelectedSectionId(restoredSections[0]?.id ?? "");
     setSelectedHeaderId(restoredSections[0]?.headers[0]?.id ?? "");
     setIsReviewLoaded(shouldShowReview && restoredSections.length > 0);
+    setSupportingFiles(document.supporting_files ?? []);
+    setVerificationReport(document.verification_report ?? null);
 
     if (document.status === "detecting") {
       setIsDetecting(true);
@@ -793,6 +871,8 @@ function DocumentWorkflow() {
             setSelectedHeaderId("");
             setIsReviewLoaded(false);
           }}
+          selectedSupportingFiles={selectedSupportingFiles}
+          onSelectedSupportingFilesChange={setSelectedSupportingFiles}
           onSubmit={handleUpload}
           selectedFile={selectedFile}
           detectionResult={detectionResult}
@@ -845,6 +925,23 @@ function DocumentWorkflow() {
           selectedSectionId={selectedSectionId}
         />
       )}
+      
+      {uploadResult && (
+        <VerificationPanel
+          documentId={uploadResult.id}
+          documentStatus={activeDocument.status}
+          hasJson={Boolean(extractionResult?.output_json)}
+          supportingFiles={supportingFiles}
+          isUploadingSupporting={isUploadingSupporting}
+          supportingUploadError={supportingUploadError}
+          verificationReport={verificationReport}
+          isVerifying={isVerifying}
+          verificationError={verificationError}
+          onSupportingUpload={handleSupportingUpload}
+          onSupportingDelete={handleSupportingDelete}
+          onVerify={handleVerify}
+        />
+      )}
     </main>
   );
 }
@@ -868,28 +965,51 @@ function UploadAndLoadReview({
   onDownloadJson,
   onExtractJson,
   onSelectedFileChange,
+  selectedSupportingFiles,
+  onSelectedSupportingFilesChange,
   onSubmit,
   onLoadReview,
 }) {
   return (
-    <section className="status-panel" aria-labelledby="app-title">
+    <>
+      <section className="status-panel" aria-labelledby="app-title">
       <p className="eyebrow">Document JSON Extractor</p>
       <h1 id="app-title">Upload document</h1>
       <p className="status-line">backend: {backendStatus}</p>
 
       <form className="upload-form" onSubmit={onSubmit}>
-        <label className="file-label" htmlFor="document-file">
-          Document file
-        </label>
-        <input
-          accept=".xlsx,.pdf"
-          id="document-file"
-          name="file"
-          onChange={(event) => onSelectedFileChange(event.target.files?.[0] ?? null)}
-          type="file"
-        />
+        <div className="upload-form-group">
+          <label className="file-label" htmlFor="document-file">
+            Excel Document (Required)
+          </label>
+          <input
+            accept=".xlsx"
+            id="document-file"
+            name="file"
+            onChange={(event) => onSelectedFileChange(event.target.files?.[0] ?? null)}
+            type="file"
+            required
+          />
+        </div>
+        <div className="upload-form-group">
+          <label className="file-label" htmlFor="supporting-documents">
+            Supporting PDFs (Optional)
+          </label>
+          <input
+            accept=".pdf"
+            id="supporting-documents"
+            name="supporting_files"
+            multiple
+            onChange={(event) => {
+              if (onSelectedSupportingFilesChange) {
+                onSelectedSupportingFilesChange(Array.from(event.target.files));
+              }
+            }}
+            type="file"
+          />
+        </div>
         <button disabled={!selectedFile || isUploading} type="submit">
-          {isUploading ? "Uploading..." : "Upload"}
+          {isUploading ? "Uploading & Processing..." : "Upload & Process"}
         </button>
       </form>
 
@@ -956,7 +1076,9 @@ function UploadAndLoadReview({
           onExtract={onExtractJson}
         />
       ) : null}
-    </section>
+
+      </section>
+    </>
   );
 }
 
@@ -1587,3 +1709,251 @@ function getDefaultSchemaName(fileName) {
 
   return fileName.replace(/\.[^.]+$/, "") || DEFAULT_SCHEMA_NAME;
 }
+
+function VerificationPanel({
+  documentId,
+  documentStatus,
+  hasJson,
+  supportingFiles,
+  isUploadingSupporting,
+  supportingUploadError,
+  verificationReport,
+  isVerifying,
+  verificationError,
+  onSupportingUpload,
+  onSupportingDelete,
+  onVerify,
+}) {
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const canVerify = hasJson && supportingFiles.length > 0;
+
+  const filteredFields = useMemo(() => {
+    if (!verificationReport?.fields) return [];
+    return verificationReport.fields.filter((field) => {
+      const matchesFilter = statusFilter === "all" || field.status === statusFilter;
+      const matchesSearch =
+        field.field_path.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        String(field.extracted_value).toLowerCase().includes(searchTerm.toLowerCase()) ||
+        String(field.found_value || "").toLowerCase().includes(searchTerm.toLowerCase()) ||
+        String(field.citation || "").toLowerCase().includes(searchTerm.toLowerCase());
+      return matchesFilter && matchesSearch;
+    });
+  }, [verificationReport, statusFilter, searchTerm]);
+
+  return (
+    <section className="panel verification-panel" aria-labelledby="verification-title">
+      <div className="panel-heading panel-heading-row">
+        <div>
+          <p className="eyebrow">Verification</p>
+          <h2 id="verification-title">Supporting Documents & Verification</h2>
+        </div>
+      </div>
+
+      <div className="verification-layout">
+        {/* Left Column: Upload and Trigger */}
+        <div className="verification-sidebar">
+          <h3>Supporting Documents (PDFs)</h3>
+          <p className="panel-copy">
+            Upload PDF files (such as invoices, purchase orders, or contracts) to verify the extracted Excel data.
+          </p>
+
+          <div className="supporting-upload-zone">
+            <input
+              type="file"
+              accept=".pdf"
+              id="supporting-file-input"
+              style={{ display: "none" }}
+              onChange={onSupportingUpload}
+              disabled={isUploadingSupporting}
+            />
+            <label htmlFor="supporting-file-input" className="button-secondary supporting-upload-btn">
+              {isUploadingSupporting ? "Uploading..." : "Upload Supporting PDF"}
+            </label>
+            {supportingUploadError && <p className="error-message">{supportingUploadError}</p>}
+          </div>
+
+          <div className="supporting-files-list">
+            {supportingFiles.length === 0 ? (
+              <p className="empty-state-mini">No supporting PDFs uploaded yet.</p>
+            ) : (
+              <ul>
+                {supportingFiles.map((file) => (
+                  <li key={file.id} className="supporting-file-item">
+                    <span className="file-name" title={file.filename}>
+                      📄 {file.filename}
+                    </span>
+                    <button
+                      type="button"
+                      className="delete-file-btn"
+                      onClick={() => onSupportingDelete(file.id)}
+                      title="Remove document"
+                    >
+                      ✕
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="verification-trigger-zone">
+            <button
+              type="button"
+              className="primary-button verify-btn"
+              disabled={!canVerify || isVerifying}
+              onClick={onVerify}
+            >
+              {isVerifying ? "Verifying Extracted Data..." : "Verify Extracted Data"}
+            </button>
+
+            {!hasJson && (
+              <p className="helper-text warning">⚠️ You must extract JSON from the Excel document first.</p>
+            )}
+            {hasJson && supportingFiles.length === 0 && (
+              <p className="helper-text info">ℹ️ Upload at least one supporting PDF to enable verification.</p>
+            )}
+            {verificationError && <p className="error-message">{verificationError}</p>}
+          </div>
+        </div>
+
+        {/* Right Column: Verification Results */}
+        <div className="verification-content">
+          {isVerifying ? (
+            <div className="verification-loader-container">
+              <span className="loader-spinner" aria-hidden="true" />
+              <p>Analyzing supporting PDFs and verifying extracted JSON values using Gemini...</p>
+            </div>
+          ) : verificationReport ? (
+            <div className="verification-results">
+              {/* Summary Cards */}
+              <div className="verification-summary-card">
+                <div className="metric-container">
+                  <div className="metric-ring">
+                    <span className="metric-value">{Math.round(verificationReport.summary?.percentage ?? 0)}%</span>
+                    <span className="metric-label">Verified</span>
+                  </div>
+                  <div className="metric-stats">
+                    <div className="stat-row">
+                      <span className="badge status-verified">Verified</span>
+                      <span className="stat-val">{verificationReport.summary?.verified_fields ?? 0} fields</span>
+                    </div>
+                    <div className="stat-row">
+                      <span className="badge status-mismatch">Mismatch</span>
+                      <span className="stat-val">{verificationReport.summary?.mismatched_fields ?? 0} fields</span>
+                    </div>
+                    <div className="stat-row">
+                      <span className="badge status-not_found">Not Found</span>
+                      <span className="stat-val">{verificationReport.summary?.not_found_fields ?? 0} fields</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="summary-text-block">
+                  <h4>Verification Overview</h4>
+                  <p>{verificationReport.summary?.textual_summary}</p>
+                </div>
+              </div>
+
+              {/* Filters & Search */}
+              <div className="results-toolbar">
+                <div className="filter-buttons">
+                  <button
+                    className={`filter-btn ${statusFilter === "all" ? "active" : ""}`}
+                    onClick={() => setStatusFilter("all")}
+                  >
+                    All ({verificationReport.summary?.total_fields ?? 0})
+                  </button>
+                  <button
+                    className={`filter-btn ${statusFilter === "verified" ? "active" : ""}`}
+                    onClick={() => setStatusFilter("verified")}
+                  >
+                    Verified ({verificationReport.summary?.verified_fields ?? 0})
+                  </button>
+                  <button
+                    className={`filter-btn ${statusFilter === "mismatch" ? "active" : ""}`}
+                    onClick={() => setStatusFilter("mismatch")}
+                  >
+                    Mismatch ({verificationReport.summary?.mismatched_fields ?? 0})
+                  </button>
+                  <button
+                    className={`filter-btn ${statusFilter === "not_found" ? "active" : ""}`}
+                    onClick={() => setStatusFilter("not_found")}
+                  >
+                    Not Found ({verificationReport.summary?.not_found_fields ?? 0})
+                  </button>
+                </div>
+                <input
+                  type="text"
+                  placeholder="Search verified fields..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="search-input"
+                />
+              </div>
+
+              {/* Table of Fields */}
+              <div className="verification-table-container">
+                {filteredFields.length === 0 ? (
+                  <p className="empty-results">No fields match the selected filter/search criteria.</p>
+                ) : (
+                  <table className="verification-table">
+                    <thead>
+                      <tr>
+                        <th>Field Path</th>
+                        <th>Extracted Value (Excel)</th>
+                        <th>Status</th>
+                        <th>Found Value (PDF)</th>
+                        <th>Citation & Context</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredFields.map((field, idx) => (
+                        <tr key={idx} className={`row-status-${field.status}`}>
+                          <td className="field-path"><code>{field.field_path}</code></td>
+                          <td className="field-value">
+                            {typeof field.extracted_value === "object" && field.extracted_value !== null
+                              ? JSON.stringify(field.extracted_value)
+                              : String(field.extracted_value ?? "")}
+                          </td>
+                          <td>
+                            <span className={`badge status-${field.status}`}>{field.status}</span>
+                          </td>
+                          <td className="field-value font-mismatch">
+                            {field.status === "mismatch"
+                              ? (typeof field.found_value === "object" && field.found_value !== null
+                                ? JSON.stringify(field.found_value)
+                                : String(field.found_value ?? ""))
+                              : field.status === "verified"
+                              ? "—"
+                              : "Not found"}
+                          </td>
+                          <td className="field-citation">
+                            {field.citation ? (
+                              <span title={field.citation}>{field.citation}</span>
+                            ) : (
+                              <span className="muted">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="verification-empty-prompt">
+              <div className="prompt-content">
+                <span className="prompt-icon">🔍</span>
+                <h4>Ready for Verification</h4>
+                <p>Upload supporting PDF documents and click "Verify Extracted Data" to run verification.</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+

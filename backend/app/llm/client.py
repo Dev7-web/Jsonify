@@ -49,6 +49,7 @@ def call_llm(
     temperature: float = DEFAULT_LLM_TEMPERATURE,
     max_retries: int | None = None,
     response_mime_type: str | None = None,
+    response_schema: object | None = None,
 ) -> str:
     """Call Gemini synchronously. Use from scripts and sync code only."""
     _validate_prompts(system, user)
@@ -60,6 +61,7 @@ def call_llm(
         temperature=temperature,
         max_retries=get_llm_max_retries() if max_retries is None else max_retries,
         response_mime_type=response_mime_type,
+        response_schema=response_schema,
     )
 
 
@@ -71,6 +73,7 @@ async def acall_llm(
     temperature: float = DEFAULT_LLM_TEMPERATURE,
     max_retries: int | None = None,
     response_mime_type: str | None = None,
+    response_schema: object | None = None,
 ) -> str:
     """Async sibling of `call_llm`. Use from FastAPI route handlers so retry
     sleeps don't block the event loop."""
@@ -83,6 +86,7 @@ async def acall_llm(
         temperature=temperature,
         max_retries=get_llm_max_retries() if max_retries is None else max_retries,
         response_mime_type=response_mime_type,
+        response_schema=response_schema,
     )
 
 
@@ -94,6 +98,7 @@ async def gemini_call(
     temperature: float = DEFAULT_LLM_TEMPERATURE,
     max_retries: int | None = None,
     response_mime_type: str | None = None,
+    response_schema: object | None = None,
 ) -> str:
     return await acall_llm(
         system,
@@ -102,6 +107,7 @@ async def gemini_call(
         temperature=temperature,
         max_retries=max_retries,
         response_mime_type=response_mime_type,
+        response_schema=response_schema,
     )
 
 
@@ -213,6 +219,7 @@ def _build_config(
     system: str,
     temperature: float,
     response_mime_type: str | None,
+    response_schema: object | None = None,
 ) -> types.GenerateContentConfig:
     kwargs: dict[str, object] = {
         "system_instruction": system,
@@ -220,6 +227,8 @@ def _build_config(
     }
     if response_mime_type is not None:
         kwargs["response_mime_type"] = response_mime_type
+    if response_schema is not None:
+        kwargs["response_schema"] = response_schema
     return types.GenerateContentConfig(**kwargs)
 
 
@@ -232,9 +241,10 @@ def _call_with_retry_sync(
     temperature: float,
     max_retries: int,
     response_mime_type: str | None,
+    response_schema: object | None = None,
 ) -> str:
     retry_base_seconds = get_llm_retry_base_seconds()
-    config = _build_config(system, temperature, response_mime_type)
+    config = _build_config(system, temperature, response_mime_type, response_schema)
 
     for attempt in range(max_retries + 1):
         try:
@@ -265,9 +275,10 @@ async def _call_with_retry_async(
     temperature: float,
     max_retries: int,
     response_mime_type: str | None,
+    response_schema: object | None = None,
 ) -> str:
     retry_base_seconds = get_llm_retry_base_seconds()
-    config = _build_config(system, temperature, response_mime_type)
+    config = _build_config(system, temperature, response_mime_type, response_schema)
 
     for attempt in range(max_retries + 1):
         try:

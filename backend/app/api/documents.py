@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 import aiofiles
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -41,6 +41,13 @@ from ..pipeline.extract import (
     extract_document_json,
     get_document_output_json,
 )
+from ..pipeline.verify import (
+    VerificationDocumentNotFoundError,
+    VerificationError,
+    VerificationMissingDataError,
+    run_document_verification,
+)
+
 
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -69,6 +76,19 @@ class DocumentCreateResponse(BaseModel):
     status: DocumentStatus
 
 
+class SupportingFileResponse(BaseModel):
+    id: str
+    filename: str
+    stored_path: str
+    uploaded_at: str
+
+
+class VerificationReportResponse(BaseModel):
+    id: str
+    status: DocumentStatus
+    verification_report: dict[str, Any] | None = None
+
+
 class DocumentResponse(BaseModel):
     id: str
     filename: str
@@ -83,6 +103,9 @@ class DocumentResponse(BaseModel):
     matched_schema_id: str | None = None
     failure_reason: str | None = None
     detection_progress: dict[str, Any] | None = None
+    supporting_files: list[dict[str, Any]] = Field(default_factory=list)
+    verification_report: dict[str, Any] | None = None
+
 
 
 class DocumentDetectHeadersResponse(BaseModel):
@@ -234,7 +257,10 @@ async def save_upload_file(upload: UploadFile, destination: Path) -> None:
 
 
 @router.post("", response_model=DocumentCreateResponse, status_code=status.HTTP_201_CREATED)
-async def create_document(file: UploadFile) -> DocumentCreateResponse:
+async def create_document(
+    file: UploadFile,
+    supporting_files: list[UploadFile] = File(default=[]),
+) -> DocumentCreateResponse:
     if not file.filename:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -251,29 +277,72 @@ async def create_document(file: UploadFile) -> DocumentCreateResponse:
     relative_stored_path = f"{UPLOAD_DIR_NAME}/{stored_filename}"
     absolute_stored_path = UPLOAD_DIR / stored_filename
 
+    processed_supporting_files = []
+    saved_supporting_paths = []
+    
+    for supp_file in supporting_files:
+        if not supp_file.filename:
+            continue
+            
+        supp_original_filename = Path(supp_file.filename).name
+        supp_extension = Path(supp_original_filename).suffix.lower()
+        if supp_extension != ".pdf":
+            continue
+            
+        await validate_magic_bytes(supp_file, "pdf")
+        
+        file_id = str(uuid4())
+        supp_stored_filename = f"supporting_{document_id}_{file_id}_{supp_original_filename}"
+        supp_relative_path = f"{UPLOAD_DIR_NAME}/{supp_stored_filename}"
+        supp_absolute_path = UPLOAD_DIR / supp_stored_filename
+        
+        processed_supporting_files.append({
+            "upload_file": supp_file,
+            "absolute_path": supp_absolute_path,
+            "record": {
+                "id": file_id,
+                "filename": supp_original_filename,
+                "stored_path": supp_relative_path,
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        })
+
     document = Document(
         id=document_id,
         filename=original_filename,
         file_type=file_type,
         stored_path=relative_stored_path,
+        supporting_files=[p["record"] for p in processed_supporting_files]
     )
 
     try:
         await save_upload_file(file, absolute_stored_path)
+        for p in processed_supporting_files:
+            await save_upload_file(p["upload_file"], p["absolute_path"])
+            saved_supporting_paths.append(p["absolute_path"])
+            
         await get_db().documents.insert_one(document.model_dump(by_alias=True))
     except HTTPException:
         if absolute_stored_path.exists():
             absolute_stored_path.unlink()
+        for path in saved_supporting_paths:
+            if path.exists():
+                path.unlink()
         raise
     except Exception as error:
         if absolute_stored_path.exists():
             absolute_stored_path.unlink()
+        for path in saved_supporting_paths:
+            if path.exists():
+                path.unlink()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not save uploaded document.",
         ) from error
     finally:
         await file.close()
+        for supp_file in supporting_files:
+            await supp_file.close()
 
     return DocumentCreateResponse(
         id=document.id,
@@ -307,6 +376,8 @@ async def get_document(document_id: str) -> DocumentResponse:
         matched_schema_id=document.matched_schema_id,
         failure_reason=document.failure_reason,
         detection_progress=document.detection_progress,
+        supporting_files=document.supporting_files,
+        verification_report=document.verification_report,
     )
 
 
@@ -571,3 +642,171 @@ async def get_json(document_id: str) -> DocumentJsonResponse:
         ) from error
 
     return DocumentJsonResponse(**result)
+
+
+@router.post("/{document_id}/supporting", response_model=list[SupportingFileResponse])
+async def upload_supporting_document(
+    document_id: str,
+    file: UploadFile,
+) -> list[SupportingFileResponse]:
+    record = await get_db().documents.find_one({"_id": document_id})
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document not found: {document_id}",
+        )
+
+    if not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file must have a filename.",
+        )
+
+    original_filename = Path(file.filename).name
+    extension = Path(original_filename).suffix.lower()
+    if extension != ".pdf":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only .pdf files are supported for verification.",
+        )
+
+    await validate_magic_bytes(file, "pdf")
+
+    file_id = str(uuid4())
+    stored_filename = f"supporting_{document_id}_{file_id}_{original_filename}"
+    relative_stored_path = f"{UPLOAD_DIR_NAME}/{stored_filename}"
+    absolute_stored_path = UPLOAD_DIR / stored_filename
+
+    try:
+        await save_upload_file(file, absolute_stored_path)
+    except Exception as error:
+        if absolute_stored_path.exists():
+            absolute_stored_path.unlink()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not save supporting file: {str(error)}",
+        ) from error
+
+    new_file = {
+        "id": file_id,
+        "filename": original_filename,
+        "stored_path": relative_stored_path,
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    result = await get_db().documents.find_one_and_update(
+        {"_id": document_id},
+        {"$push": {"supporting_files": new_file}},
+        return_document=True,
+    )
+
+    updated_document = Document.model_validate(result)
+
+    return [
+        SupportingFileResponse(
+            id=f["id"],
+            filename=f["filename"],
+            stored_path=f["stored_path"],
+            uploaded_at=f["uploaded_at"],
+        )
+        for f in updated_document.supporting_files
+    ]
+
+
+@router.delete("/{document_id}/supporting/{file_id}", response_model=list[SupportingFileResponse])
+async def delete_supporting_document(
+    document_id: str,
+    file_id: str,
+) -> list[SupportingFileResponse]:
+    record = await get_db().documents.find_one({"_id": document_id})
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document not found: {document_id}",
+        )
+    document = Document.model_validate(record)
+
+    file_to_delete = None
+    for f in document.supporting_files:
+        if f["id"] == file_id:
+            file_to_delete = f
+            break
+
+    if file_to_delete is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Supporting file not found: {file_id}",
+        )
+
+    absolute_path = (BACKEND_ROOT / file_to_delete["stored_path"]).resolve()
+    if absolute_path.exists():
+        absolute_path.unlink()
+
+    result = await get_db().documents.find_one_and_update(
+        {"_id": document_id},
+        {"$pull": {"supporting_files": {"id": file_id}}},
+        return_document=True,
+    )
+
+    updated_document = Document.model_validate(result)
+
+    return [
+        SupportingFileResponse(
+            id=f["id"],
+            filename=f["filename"],
+            stored_path=f["stored_path"],
+            uploaded_at=f["uploaded_at"],
+        )
+        for f in updated_document.supporting_files
+    ]
+
+
+@router.post("/{document_id}/verify", response_model=VerificationReportResponse)
+async def verify_extracted_data(document_id: str) -> VerificationReportResponse:
+    try:
+        report = await run_document_verification(document_id)
+        record = await get_db().documents.find_one({"_id": document_id})
+        updated_doc = Document.model_validate(record)
+        return VerificationReportResponse(
+            id=document_id,
+            status=updated_doc.status,
+            verification_report=report,
+        )
+    except VerificationDocumentNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except VerificationMissingDataError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except VerificationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(error),
+        ) from error
+
+
+@router.get("/{document_id}/verification-report", response_model=VerificationReportResponse)
+async def get_verification_report(document_id: str) -> VerificationReportResponse:
+    record = await get_db().documents.find_one({"_id": document_id})
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document not found: {document_id}",
+        )
+    document = Document.model_validate(record)
+    if not document.verification_report:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Verification report not found for document: {document_id}",
+        )
+
+    return VerificationReportResponse(
+        id=document_id,
+        status=document.status,
+        verification_report=document.verification_report,
+    )
+

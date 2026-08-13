@@ -41,9 +41,13 @@ export async function getHealth() {
   return parseApiResponse(response, `Health check failed with status ${response.status}`);
 }
 
-export async function uploadDocument(file) {
+export async function uploadDocument(file, supportingFiles = []) {
   const formData = new FormData();
   formData.append("file", file);
+  
+  for (const suppFile of supportingFiles) {
+    formData.append("supporting_files", suppFile);
+  }
 
   const response = await fetch(`${API_BASE_URL}/documents`, {
     method: "POST",
@@ -121,3 +125,50 @@ export function createDetectionEventSource(eventUrl) {
   const url = eventUrl.startsWith("http") ? eventUrl : `${API_BASE_URL}${eventUrl}`;
   return new EventSource(url);
 }
+
+export async function uploadSupportingFile(documentId, file) {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/supporting`, {
+    method: "POST",
+    body: formData,
+  });
+
+  return parseApiResponse(
+    response,
+    `Uploading supporting file failed with status ${response.status}`,
+  );
+}
+
+export async function deleteSupportingFile(documentId, fileId) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/supporting/${fileId}`, {
+    method: "DELETE",
+  });
+
+  return parseApiResponse(
+    response,
+    `Deleting supporting file failed with status ${response.status}`,
+  );
+}
+
+export async function runVerification(documentId) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/verify`, {
+    method: "POST",
+  });
+
+  return parseApiResponse(
+    response,
+    `Verification failed with status ${response.status}`,
+  );
+}
+
+export async function getVerificationReport(documentId) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/verification-report`);
+
+  return parseApiResponse(
+    response,
+    `Fetching verification report failed with status ${response.status}`,
+  );
+}
+

@@ -11,6 +11,8 @@ DocumentStatus = Literal[
     "needs_review",
     "approved",
     "extracted",
+    "verifying",
+    "verified",
     "failed",
 ]
 FileType = Literal["xlsx", "pdf"]
@@ -43,6 +45,8 @@ class Document(BaseModel):
     extraction_locators: dict[str, Any] | None = None
     output_json: dict[str, Any] | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    supporting_files: list[dict[str, Any]] = Field(default_factory=list)
+    verification_report: dict[str, Any] | None = None
     failure_reason: str | None = None
     created_at: datetime = Field(default_factory=_now_utc)
 
